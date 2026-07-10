@@ -4,16 +4,22 @@
 // Integrated with semi-implicit Euler at a fixed 120 Hz, decoupled from the
 // render rate by an accumulator loop.
 //
-// The controller outputs u = u_ff + PID(e), where u_ff = 0.9*m*g is gravity
-// feedforward with a deliberate 10% mass-model error — the integral term
-// absorbs the difference. Mass and gravity are live sliders: the plant can
-// change under the controller in real time.
+// The controller outputs u_cmd = u_ff + PID(e), where u_ff is gravity
+// feedforward using the *estimated* mass (the "mass estimate x" slider lies
+// to the controller; the integral term absorbs the model error). The command
+// then passes through a selectable actuator response — INSTANT, LAG
+// (first-order), or SLEW (rate-limited) — before becoming applied thrust.
+// Plant mass, gravity, and max thrust are live sliders.
 //
 // Layout: flight view center, telemetry panel left, controller panel right
-// (sliders, P/PI/PD/PID structure, presets, optional root locus), 20 s strip
-// chart bottom. The root locus sweeps Kp with Ki/Kd held, from the
-// continuous-time characteristic equation m*s^3 + (c+Kd)*s^2 + Kp*s + Ki = 0
-// (derivative filter and 120 Hz sampling ignored).
+// (sliders, P/PI/PD/PID structure, presets, actuator profile, optional root
+// locus), 20 s strip chart bottom-left, target sequence editor bottom-right
+// (draggable numbered points define a stepped setpoint profile; PLAY runs it
+// against sim time).
+//
+// Root locus: continuous-time characteristic equation
+// m*s^3 + (c+Kd)*s^2 + Kp*s + Ki = 0, swept over Kp with Ki/Kd held
+// (derivative filter, actuator response, and 120 Hz sampling ignored).
 //
 // Keys:  P PID on/off | W wind | ENTER pause | UP/DOWN or click view: setpoint
 //        SPACE manual thrust | L root locus | R reset
@@ -30,16 +36,25 @@
 #define MASS_DEF    1.0f             // default craft mass [kg]
 #define G_DEF       9.81f            // default gravity [m/s^2]
 #define DRAG        0.15f            // linear drag coefficient [N*s/m]
-#define U_MAX       25.0f            // max thrust [N]
+#define UMAX_DEF    50.0f            // default max thrust [N]
+#define UMAX_TOP    100.0f           // max-thrust slider ceiling [N]
 #define WORLD_H     100.0f           // visible altitude range [m]
 #define START_Y     50.0f            // spawn altitude [m]
+
+// ---------- actuator response ----------
+typedef enum { TP_INSTANT, TP_LAG, TP_SLEW } ThrustProf;
+static const char *PROF_LABEL[3] = { "INSTANT", "LAG", "SLEW" };
+#define ACT_TAU     0.2f             // LAG: first-order time constant [s]
+#define ACT_SLEW    60.0f            // SLEW: max thrust rate [N/s]
 
 // ---------- controller constants ----------
 #define KP_DEF      4.0f
 #define KI_DEF      0.5f
 #define KD_DEF      4.0f
+#define KP_TOP      50.0f            // slider ceilings
+#define KI_TOP      20.0f
+#define KD_TOP      30.0f
 #define D_TAU       0.05f            // derivative low-pass time constant [s]
-#define MASS_EST_RATIO 0.9f          // controller's mass model = 90% of truth
 #define SP_START    50.0f            // initial setpoint [m]
 #define SP_RATE     15.0f            // setpoint slew from arrow keys [m/s]
 
@@ -48,7 +63,7 @@
 #define GUST_GAP_MAX  6.0f
 #define GUST_DUR_MIN  1.0f           // gust duration [s]
 #define GUST_DUR_MAX  2.0f
-#define WIND_AMP_MAX  15.0f          // slider ceiling for peak gust force [N]
+#define WIND_AMP_MAX  50.0f          // slider ceiling for peak gust force [N]
 
 // ---------- layout ----------
 #define SCREEN_W    1280
@@ -60,13 +75,24 @@
 #define CRAFT_W_PX  30
 #define CRAFT_H_PX  40
 
-// ---------- strip chart ----------
+// ---------- strip chart (bottom left) ----------
 #define CHART_N     600              // samples in the ring buffer
 #define CHART_HZ    30               // sample rate -> 20 s window
 #define CHART_X     10
 #define CHART_Y     615
-#define CHART_W     1260
+#define CHART_W     916
 #define CHART_HGT   185
+
+// ---------- target sequence editor (bottom right) ----------
+#define SEQ_MAX     10
+#define SEQ_PX      936              // panel
+#define SEQ_PY      615
+#define SEQ_PW      336
+#define SEQ_PH      185
+#define SEQ_GX      946              // graph area inside the panel
+#define SEQ_GY      674
+#define SEQ_GW      316
+#define SEQ_GH      118
 
 // controller structure: which terms are active
 typedef enum { CM_P, CM_PI, CM_PD, CM_PID } CtrlMode;
@@ -75,7 +101,7 @@ static const char *MODE_LABEL[4] = { "P", "PI", "PD", "PID" };
 typedef struct SimState {
     float y;        // altitude [m], up is positive, 0 = ground
     float v;        // vertical velocity [m/s]
-    float u;        // current thrust [N], set by input before each step
+    float u;        // applied thrust [N] (actuator output)
     float wind;     // current gust force [N], set by the gust model
     bool  landed;   // resting on the ground
 } SimState;
@@ -98,6 +124,20 @@ typedef struct Chart {
     int count;      // valid samples so far (saturates at CHART_N)
     int div;        // physics-step divider for the sample rate
 } Chart;
+
+// Stepped setpoint sequence: numbered points (time, height), sorted in time;
+// the setpoint holds `base` until point 1, then holds each point's height
+// until the next point's time.
+typedef struct Seq {
+    int   n;              // active points
+    float T;              // timeframe [s]
+    float t[SEQ_MAX];     // point times [s], kept ordered
+    float y[SEQ_MAX];     // point heights [m]
+    bool  playing;
+    float t_play;         // playback clock [s], advances with sim time
+    float base;           // setpoint captured when PLAY was pressed
+    int   drag;           // point index being dragged, -1 = none
+} Seq;
 
 static float frand(float lo, float hi)
 {
@@ -148,6 +188,24 @@ static void sim_step(SimState *s, float m, float g, float dt)
     }
 }
 
+// Actuator response: applied thrust chases the command per the profile.
+static float actuate(float u_act, float u_cmd, ThrustProf prof, float dt)
+{
+    switch (prof) {
+    case TP_LAG:
+        return u_act + (u_cmd - u_act) * dt / (ACT_TAU + dt);
+    case TP_SLEW: {
+        float du = u_cmd - u_act;
+        float lim = ACT_SLEW * dt;
+        if (du > lim)  du = lim;
+        if (du < -lim) du = -lim;
+        return u_act + du;
+    }
+    default:
+        return u_cmd;
+    }
+}
+
 // World-to-screen: altitude in meters (up) -> pixel row (down), and back.
 static int world_to_px(float y)
 {
@@ -184,7 +242,7 @@ static float chart_py(float val)
     return (float)(CHART_Y + CHART_HGT) - val / WORLD_H * (float)CHART_HGT;
 }
 
-static void chart_draw(const Chart *c)
+static void chart_draw(const Chart *c, float u_max)
 {
     DrawRectangle(CHART_X, CHART_Y, CHART_W, CHART_HGT, (Color){ 16, 21, 36, 255 });
     DrawRectangleLines(CHART_X, CHART_Y, CHART_W, CHART_HGT, DARKGRAY);
@@ -201,9 +259,9 @@ static void chart_draw(const Chart *c)
         int i1 = (i0 + 1) % CHART_N;
         float x0 = (float)CHART_X + (float)(i - 1) * dx;
         float x1 = (float)CHART_X + (float)i * dx;
-        // thrust rescaled from [0,U_MAX], wind centered on the 50 m line
-        DrawLineV((Vector2){ x0, chart_py(c->u[i0] / U_MAX * WORLD_H) },
-                  (Vector2){ x1, chart_py(c->u[i1] / U_MAX * WORLD_H) },
+        // thrust rescaled to the live [0,u_max], wind centered on the 50 m line
+        DrawLineV((Vector2){ x0, chart_py(c->u[i0] / u_max * WORLD_H) },
+                  (Vector2){ x1, chart_py(c->u[i1] / u_max * WORLD_H) },
                   Fade(ORANGE, 0.35f));
         DrawLineV((Vector2){ x0, chart_py(50.0f + c->w[i0] * (50.0f / WIND_AMP_MAX)) },
                   (Vector2){ x1, chart_py(50.0f + c->w[i1] * (50.0f / WIND_AMP_MAX)) },
@@ -215,8 +273,130 @@ static void chart_draw(const Chart *c)
     }
     DrawText("altitude", CHART_X + 8,   CHART_Y + CHART_HGT - 16, 10, RAYWHITE);
     DrawText("setpoint", CHART_X + 60,  CHART_Y + CHART_HGT - 16, 10, SKYBLUE);
-    DrawText("thrust",   CHART_X + 112, CHART_Y + CHART_HGT - 16, 10, Fade(ORANGE, 0.7f));
-    DrawText("wind",     CHART_X + 152, CHART_Y + CHART_HGT - 16, 10, Fade(PURPLE, 0.8f));
+    DrawText(TextFormat("thrust (0-%.0f N)", u_max),
+             CHART_X + 112, CHART_Y + CHART_HGT - 16, 10, Fade(ORANGE, 0.7f));
+    DrawText(TextFormat("wind (+-%.0f N)", WIND_AMP_MAX),
+             CHART_X + 210, CHART_Y + CHART_HGT - 16, 10, Fade(PURPLE, 0.8f));
+}
+
+// ---------- target sequence ----------
+
+// Keep points inside the timeframe/world and ordered in time.
+static void seq_normalize(Seq *q)
+{
+    for (int i = 0; i < q->n; i++) {
+        if (q->t[i] < 0.05f)  q->t[i] = 0.05f;
+        if (i > 0 && q->t[i] < q->t[i - 1] + 0.1f) q->t[i] = q->t[i - 1] + 0.1f;
+        if (q->t[i] > q->T)   q->t[i] = q->T;
+        if (q->y[i] < 0.0f)   q->y[i] = 0.0f;
+        if (q->y[i] > WORLD_H) q->y[i] = WORLD_H;
+    }
+}
+
+// Stepped profile: hold base until point 1, then each height until the next.
+static float seq_eval(const Seq *q, float t)
+{
+    float sp = q->base;
+    for (int i = 0; i < q->n; i++) {
+        if (t >= q->t[i]) sp = q->y[i];
+        else break;
+    }
+    return sp;
+}
+
+static float seq_sx(const Seq *q, float t)
+{
+    return (float)SEQ_GX + t / q->T * (float)SEQ_GW;
+}
+
+static float seq_sy(float y)
+{
+    return (float)(SEQ_GY + SEQ_GH) - y / WORLD_H * (float)SEQ_GH;
+}
+
+// Draw the editor panel and handle its widgets and point dragging.
+// live_setpoint is the current target (baseline of the profile when idle).
+static void seq_panel(Seq *q, float live_setpoint)
+{
+    DrawRectangleLines(SEQ_PX, SEQ_PY, SEQ_PW, SEQ_PH, DARKGRAY);
+    DrawText("TARGET SEQUENCE", SEQ_PX + 10, SEQ_PY + 6, 16, GRAY);
+
+    if (ui_button((Rectangle){ SEQ_PX + SEQ_PW - 82, SEQ_PY + 4, 74, 22 },
+                  q->playing ? "STOP" : "PLAY", q->playing)) {
+        q->playing = !q->playing;
+        if (q->playing) {
+            q->t_play = 0.0f;
+            q->base = live_setpoint;
+        }
+    }
+
+    // point count and timeframe; times rescale proportionally with T
+    float nf = ui_slider(9, SEQ_PX + 10, SEQ_PY + 26, 140, "points",
+                         (float)q->n, 2.0f, (float)SEQ_MAX, "%.0f");
+    q->n = (int)(nf + 0.5f);
+    float newT = ui_slider(10, SEQ_PX + 168, SEQ_PY + 26, 148, "seconds",
+                           q->T, 5.0f, 60.0f, "%.0f");
+    if (fabsf(newT - q->T) > 1e-6f) {
+        float scale = newT / q->T;
+        for (int i = 0; i < SEQ_MAX; i++) q->t[i] *= scale;
+        q->T = newT;
+    }
+
+    // graph frame
+    DrawRectangle(SEQ_GX, SEQ_GY, SEQ_GW, SEQ_GH, (Color){ 16, 21, 36, 255 });
+    DrawRectangleLines(SEQ_GX, SEQ_GY, SEQ_GW, SEQ_GH, DARKGRAY);
+    int mid = (int)seq_sy(50.0f);
+    DrawLine(SEQ_GX, mid, SEQ_GX + SEQ_GW, mid, Fade(DARKGRAY, 0.5f));
+    DrawText("0", SEQ_GX + 2, SEQ_GY + SEQ_GH - 12, 10, DARKGRAY);
+    DrawText(TextFormat("%.0fs", q->T), SEQ_GX + SEQ_GW - 24, SEQ_GY + SEQ_GH - 12, 10, DARKGRAY);
+    DrawText("50m", SEQ_GX + 2, mid - 12, 10, DARKGRAY);
+
+    // point dragging (allowed even while playing — the profile is live)
+    Vector2 mp = GetMousePosition();
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !ui_dragging()) {
+        for (int i = 0; i < q->n; i++) {
+            float dxp = mp.x - seq_sx(q, q->t[i]);
+            float dyp = mp.y - seq_sy(q->y[i]);
+            if (dxp * dxp + dyp * dyp < 100.0f) { q->drag = i; break; }
+        }
+    }
+    if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) q->drag = -1;
+    if (q->drag >= 0) {
+        q->t[q->drag] = (mp.x - (float)SEQ_GX) / (float)SEQ_GW * q->T;
+        q->y[q->drag] = ((float)(SEQ_GY + SEQ_GH) - mp.y) / (float)SEQ_GH * WORLD_H;
+    }
+    seq_normalize(q);
+
+    // stepped profile: horizontal holds with faint vertical connectors
+    float base = q->playing ? q->base : live_setpoint;
+    float prev_y = base;
+    float prev_x = (float)SEQ_GX;
+    for (int i = 0; i <= q->n; i++) {
+        float seg_end = (i < q->n) ? seq_sx(q, q->t[i]) : (float)(SEQ_GX + SEQ_GW);
+        DrawLineV((Vector2){ prev_x, seq_sy(prev_y) },
+                  (Vector2){ seg_end, seq_sy(prev_y) }, GOLD);
+        if (i < q->n) {
+            DrawLineV((Vector2){ seg_end, seq_sy(prev_y) },
+                      (Vector2){ seg_end, seq_sy(q->y[i]) }, Fade(GOLD, 0.35f));
+            prev_y = q->y[i];
+            prev_x = seg_end;
+        }
+    }
+
+    // numbered points
+    for (int i = 0; i < q->n; i++) {
+        float px = seq_sx(q, q->t[i]), py = seq_sy(q->y[i]);
+        DrawCircleV((Vector2){ px, py }, 5.0f, (q->drag == i) ? RAYWHITE : SKYBLUE);
+        DrawText(TextFormat("%d", i + 1), (int)px + 6, (int)py - 14, 10, LIGHTGRAY);
+    }
+
+    // playback cursor
+    if (q->playing) {
+        float cx = seq_sx(q, q->t_play);
+        DrawLineV((Vector2){ cx, (float)SEQ_GY }, (Vector2){ cx, (float)(SEQ_GY + SEQ_GH) },
+                  Fade(RED, 0.8f));
+        DrawText(TextFormat("t = %.1f s", q->t_play), SEQ_GX + SEQ_GW - 70, SEQ_GY + 4, 10, RED);
+    }
 }
 
 // ---------- root locus ----------
@@ -302,7 +482,7 @@ static void locus_draw(int lx, int ly, int lw, int lh,
     // branches: sweep Kp with Ki, Kd held at current values
     double re[3], im[3];
     for (int i = 1; i <= 240; i++) {
-        double k = 20.0 * (double)i / 240.0;
+        double k = (double)KP_TOP * (double)i / 240.0;
         int n = poles(m, DRAG, k, ki, kd, re, im);
         for (int j = 0; j < n; j++) {
             if (re[j] < RE_MIN || re[j] > RE_MAX || fabs(im[j]) > IM_MAX) continue;
@@ -323,8 +503,9 @@ static void locus_draw(int lx, int ly, int lw, int lh,
         DrawLine(px - 4, py + 4, px + 4, py - 4, col);
     }
 
-    DrawText("root locus: poles vs Kp 0..20 (Ki, Kd held)", lx + 6, ly + 4, 10, LIGHTGRAY);
-    DrawText("s-plane, filter/sampling ignored", lx + 6, ly + 16, 10, DARKGRAY);
+    DrawText(TextFormat("root locus: poles vs Kp 0..%.0f (Ki, Kd held)", KP_TOP),
+             lx + 6, ly + 4, 10, LIGHTGRAY);
+    DrawText("s-plane; filter/actuator/sampling ignored", lx + 6, ly + 16, 10, DARKGRAY);
     DrawText("Re=0", x_zero + 3, ly + lh - 14, 10, Fade(RED, 0.8f));
 }
 
@@ -355,13 +536,16 @@ int main(void)
     float gravity = G_DEF;
     float kp = KP_DEF, ki = KI_DEF, kd = KD_DEF;
     float wind_amp = 5.0f;
+    float mass_est_ratio = 1.0f;     // controller's mass model / true mass
+    float u_max = UMAX_DEF;
     CtrlMode mode = CM_PID;
+    ThrustProf prof = TP_INSTANT;
 
     // PID handles deviations only; feedforward carries (estimated) gravity.
     // Its limits are the actuator range left after feedforward, so the
-    // anti-windup logic still sees true saturation: u_ff + out ∈ [0, U_MAX].
+    // anti-windup logic still sees true saturation: u_ff + out ∈ [0, u_max].
     PID ctrl;
-    pid_init(&ctrl, kp, ki, kd, D_TAU, 0.0f, U_MAX);  // limits set each frame
+    pid_init(&ctrl, kp, ki, kd, D_TAU, 0.0f, u_max);  // limits set each frame
     bool pid_on = false;
     float setpoint = SP_START;
 
@@ -372,6 +556,13 @@ int main(void)
 
     Chart chart = { 0 };
 
+    Seq seq = {
+        .n = 4, .T = 20.0f,
+        .t = { 2, 4, 6, 8, 10, 12, 14, 16, 18, 20 },
+        .y = { 30, 60, 20, 70, 40, 80, 25, 55, 65, 35 },
+        .playing = false, .t_play = 0.0f, .base = SP_START, .drag = -1,
+    };
+
     float acc = 0.0f;                // physics time accumulator [s]
     float t_sim = 0.0f;              // simulated time [s], drives the gusts
 
@@ -380,7 +571,7 @@ int main(void)
         float frame = GetFrameTime();
         if (frame > 0.25f) frame = 0.25f;   // clamp: no spiral of death
 
-        if (IsKeyPressed(KEY_R)) { sim_reset(&sim); pid_reset(&ctrl); }
+        if (IsKeyPressed(KEY_R)) { sim_reset(&sim); pid_reset(&ctrl); seq.playing = false; }
         if (IsKeyPressed(KEY_P)) {
             pid_on = !pid_on;
             if (pid_on) pid_reset(&ctrl);   // engage with clean state
@@ -400,7 +591,7 @@ int main(void)
 
         // click/drag inside the flight view moves the setpoint
         Vector2 mp = GetMousePosition();
-        if (!ui_dragging() && IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
+        if (!ui_dragging() && seq.drag < 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
             mp.x > VIEW_X0 && mp.x < VIEW_X1 && mp.y < VIEW_H)
             setpoint = px_to_world(mp.y);
 
@@ -412,19 +603,26 @@ int main(void)
         ctrl.kd = use_d ? kd : 0.0f;
         if (!use_i) ctrl.i_term = 0.0f;
 
-        // feedforward tracks the live plant (with its built-in 10% mass error)
-        float u_ff = MASS_EST_RATIO * mass * gravity;
-        if (u_ff > U_MAX) u_ff = U_MAX;
+        // feedforward uses the (possibly miscalculated) mass estimate
+        float u_ff = mass_est_ratio * mass * gravity;
+        if (u_ff > u_max) u_ff = u_max;
         ctrl.out_min = -u_ff;
-        ctrl.out_max = U_MAX - u_ff;
+        ctrl.out_max = u_max - u_ff;
 
         // ---------- fixed-timestep physics ----------
         if (!paused) {
             acc += frame;
             while (acc >= SIM_DT) {
+                if (seq.playing) {
+                    setpoint = seq_eval(&seq, seq.t_play);
+                    seq.t_play += SIM_DT;
+                    if (seq.t_play >= seq.T) seq.playing = false;
+                }
                 sim.wind = wind_on ? gust_force(&gust, t_sim, wind_amp) : 0.0f;
-                sim.u = pid_on ? u_ff + pid_update(&ctrl, setpoint, sim.y, SIM_DT)
-                               : (thrusting ? U_MAX : 0.0f);
+                float u_cmd = pid_on
+                            ? u_ff + pid_update(&ctrl, setpoint, sim.y, SIM_DT)
+                            : (thrusting ? u_max : 0.0f);
+                sim.u = actuate(sim.u, u_cmd, prof, SIM_DT);
                 sim_step(&sim, mass, gravity, SIM_DT);
                 t_sim += SIM_DT;
                 acc -= SIM_DT;
@@ -459,7 +657,7 @@ int main(void)
         int craftX = (VIEW_X0 + VIEW_X1) / 2 - CRAFT_W_PX / 2;
         DrawRectangle(craftX, craftBottom - CRAFT_H_PX, CRAFT_W_PX, CRAFT_H_PX, RAYWHITE);
         if (sim.u > 0.0f) {
-            float flame = 10.0f + 12.0f * sim.u / U_MAX;
+            float flame = 10.0f + 12.0f * sim.u / u_max;
             DrawTriangle((Vector2){ (float)craftX + 5,              (float)craftBottom },
                          (Vector2){ (float)craftX + CRAFT_W_PX - 5, (float)craftBottom },
                          (Vector2){ (float)(craftX + CRAFT_W_PX / 2), (float)craftBottom + flame },
@@ -487,20 +685,20 @@ int main(void)
                  wind_on ? PURPLE : DARKGRAY);
         DrawText(TextFormat("err    %+7.2f m",  setpoint - sim.y), 20, 180, 20,
                  pid_on ? SKYBLUE : DARKGRAY);
-        DrawText(TextFormat("TWR    %7.2f",
-                 (weight > 0.01f) ? U_MAX / weight : 99.99f),      20, 204, 20,
-                 (weight > U_MAX) ? RED : GREEN);
-        if (weight > U_MAX)
-            DrawText("weight exceeds max thrust!", 20, 228, 12, RED);
+        DrawText(TextFormat("thrust-to-weight %5.2f",
+                 (weight > 0.01f) ? u_max / weight : 99.99f),      20, 204, 16,
+                 (weight > u_max) ? RED : GREEN);
+        if (weight > u_max)
+            DrawText("weight exceeds max thrust!", 20, 226, 12, RED);
 
         DrawText("CONTROL EFFORT", 20, 256, 16, GRAY);
         if (pid_on) {
             term_bar("P", ctrl.p_term, 140, 280, RED);
             term_bar("I", ctrl.i_term, 140, 304, YELLOW);
             term_bar("D", ctrl.d_term, 140, 328, SKYBLUE);
-            DrawText(TextFormat("FF %+6.2f N%s", u_ff,
-                     ctrl.sat ? "  [SATURATED]" : ""), 25, 354, 16,
-                     ctrl.sat ? ORANGE : DARKGRAY);
+            DrawText(TextFormat("feedforward %+6.2f N", u_ff), 25, 354, 16, DARKGRAY);
+            if (ctrl.sat)
+                DrawText("[SATURATED]", 25, 374, 16, ORANGE);
         } else {
             DrawText("engage PID to see terms", 25, 284, 14, DARKGRAY);
         }
@@ -523,42 +721,54 @@ int main(void)
         DrawText("CONTROLLER", 940, 16, 16, GRAY);
 
         for (int i = 0; i < 4; i++) {
-            if (ui_button((Rectangle){ 940.0f + (float)i * 78.0f, 40, 74, 26 },
+            if (ui_button((Rectangle){ 940.0f + (float)i * 78.0f, 36, 74, 22 },
                           MODE_LABEL[i], mode == (CtrlMode)i)) {
                 mode = (CtrlMode)i;
                 pid_reset(&ctrl);
             }
         }
-        if (ui_button((Rectangle){ 940, 74, 100, 26 }, "UNDER", false)) {
+        if (ui_button((Rectangle){ 940, 62, 100, 22 }, "UNDER", false)) {
             kp = 8.0f; ki = 0.5f; kd = 0.8f;
         }
-        if (ui_button((Rectangle){ 1046, 74, 100, 26 }, "TUNED", false)) {
+        if (ui_button((Rectangle){ 1046, 62, 100, 22 }, "TUNED", false)) {
             kp = KP_DEF; ki = KI_DEF; kd = KD_DEF;
         }
-        if (ui_button((Rectangle){ 1152, 74, 100, 26 }, "OVER", false)) {
+        if (ui_button((Rectangle){ 1152, 62, 100, 22 }, "OVER", false)) {
             kp = 1.5f; ki = 0.2f; kd = 6.0f;
         }
 
-        kp       = ui_slider(1, 940, 112, 312, "Kp",           kp,       0.0f, 20.0f, "%.2f");
-        ki       = ui_slider(2, 940, 156, 312, "Ki",           ki,       0.0f,  5.0f, "%.2f");
-        kd       = ui_slider(3, 940, 200, 312, "Kd",           kd,       0.0f, 10.0f, "%.2f");
-        wind_amp = ui_slider(4, 940, 244, 312, "wind peak N",  wind_amp, 0.0f, WIND_AMP_MAX, "%.1f");
-        mass     = ui_slider(5, 940, 288, 312, "mass kg",      mass,     0.2f,  3.0f, "%.2f");
-        gravity  = ui_slider(6, 940, 332, 312, "gravity m/s2", gravity,  0.0f, 25.0f, "%.2f");
+        DrawText("thrust:", 940, 92, 14, LIGHTGRAY);
+        for (int i = 0; i < 3; i++) {
+            if (ui_button((Rectangle){ 1000.0f + (float)i * 88.0f, 88, 84, 22 },
+                          PROF_LABEL[i], prof == (ThrustProf)i))
+                prof = (ThrustProf)i;
+        }
 
-        if (ui_button((Rectangle){ 940, 376, 160, 26 },
+        kp       = ui_slider(1, 940, 114, 312, "Kp",              kp,       0.0f, KP_TOP, "%.2f");
+        ki       = ui_slider(2, 940, 150, 312, "Ki",              ki,       0.0f, KI_TOP, "%.2f");
+        kd       = ui_slider(3, 940, 186, 312, "Kd",              kd,       0.0f, KD_TOP, "%.2f");
+        wind_amp = ui_slider(4, 940, 222, 312, "wind peak N",     wind_amp, 0.0f, WIND_AMP_MAX, "%.1f");
+        mass     = ui_slider(5, 940, 258, 312, "mass kg",         mass,     0.2f, 3.0f,   "%.2f");
+        gravity  = ui_slider(6, 940, 294, 312, "gravity m/s2",    gravity,  0.0f, 25.0f,  "%.2f");
+        mass_est_ratio = ui_slider(7, 940, 330, 312, "mass estimate x", mass_est_ratio,
+                                   0.5f, 1.5f, "%.2f");
+        u_max    = ui_slider(8, 940, 366, 312, "max thrust N",    u_max,    5.0f, UMAX_TOP, "%.0f");
+
+        if (ui_button((Rectangle){ 940, 404, 160, 22 },
                       show_locus ? "ROOT LOCUS: ON" : "ROOT LOCUS: OFF", show_locus))
             show_locus = !show_locus;
 
         if (show_locus) {
-            locus_draw(938, 412, 326, 172, mass, ctrl.kp, ctrl.ki, ctrl.kd);
+            locus_draw(938, 432, 326, 152, mass, ctrl.kp, ctrl.ki, ctrl.kd);
         } else {
-            DrawText("moon: g=1.62   mars: g=3.71", 940, 420, 14, DARKGRAY);
-            DrawText("stability edge: raise Ki and/or Kp,", 940, 444, 14, DARKGRAY);
-            DrawText("lower Kd, and watch the chart ring", 940, 462, 14, DARKGRAY);
+            DrawText("moon: g=1.62   mars: g=3.71", 940, 440, 14, DARKGRAY);
+            DrawText("stability edge: raise Ki and/or Kp,", 940, 464, 14, DARKGRAY);
+            DrawText("lower Kd, or add LAG/SLEW thrust,", 940, 482, 14, DARKGRAY);
+            DrawText("and watch the chart ring", 940, 500, 14, DARKGRAY);
         }
 
-        chart_draw(&chart);
+        chart_draw(&chart, u_max);
+        seq_panel(&seq, setpoint);
 
         DrawText("P: PID   W: wind   L: locus   ENTER: pause   UP/DOWN or click: setpoint   "
                  "SPACE: manual   R: reset",
