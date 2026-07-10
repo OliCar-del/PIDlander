@@ -11,13 +11,25 @@ ifeq ($(RAYLIB_FLAGS),)
 RAYLIB_FLAGS := -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
 endif
 
-lander: main.c
-	$(CC) $(CFLAGS) $< -o $@ $(RAYLIB_FLAGS)
+SRC := main.c pid.c ui.c
+
+lander: $(SRC) pid.h ui.h
+	$(CC) $(CFLAGS) $(SRC) -o $@ $(RAYLIB_FLAGS)
+ifeq ($(OS),Windows_NT)
+	# MSYS2's raylib is a DLL; keep it (and its glfw3 dependency) next to
+	# the exe so lander.exe runs outside the MSYS2 shell (e.g. double-click).
+	cp -n /ucrt64/bin/libraylib.dll /ucrt64/bin/glfw3.dll . 2>/dev/null || true
+endif
 
 run: lander
 	./lander
 
-clean:
-	rm -f lander
+# Headless closed-loop tests: no raylib needed, prints step/gust metrics.
+test: test_pid.c pid.c pid.h
+	$(CC) $(CFLAGS) test_pid.c pid.c -o test_pid -lm
+	./test_pid
 
-.PHONY: run clean
+clean:
+	rm -f lander lander.exe test_pid test_pid.exe
+
+.PHONY: run test clean
