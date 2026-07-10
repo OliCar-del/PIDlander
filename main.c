@@ -1176,11 +1176,11 @@ int main(void)
             float len = clampf(8.0f + fabsf(sim.wind) * 1.2f, 8.0f, 70.0f);
             float dir = (sim.wind > 0.0f) ? 1.0f : -1.0f;
             for (int i = 0; i < WPART; i++) {
-                wpx[i] += sim.wind * 6.0f * frame;
-                if (wpx[i] > (float)VIEW_X1) wpx[i] -= (float)(VIEW_X1 - VIEW_X0);
-                if (wpx[i] < (float)VIEW_X0) wpx[i] += (float)(VIEW_X1 - VIEW_X0);
+                wpy[i] += sim.wind * 6.0f * frame;
+                if (wpy[i] > (float)VIEW_Y1) wpy[i] -= (float)(VIEW_Y1 - VIEW_Y0);
+                if (wpy[i] < (float)VIEW_Y0) wpy[i] += (float)(VIEW_Y1 - VIEW_Y0);
                 DrawLineV((Vector2){ wpx[i], wpy[i] },
-                          (Vector2){ wpx[i] - dir * len, wpy[i] },
+                          (Vector2){ wpx[i], wpy[i] - dir * len },
                           Fade(PURPLE, alpha));
             }
         }
