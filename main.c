@@ -27,6 +27,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "raylib.h"
 
@@ -82,6 +83,37 @@ static float px_to_world(float py)
     return clampf(t * WORLD_H, 0.0f, WORLD_H);
 }
 
+// --selftest: cross-check the whole history ring against a shadow copy of
+// every push. Any divergence (or a zero recorded while airborne) is logged.
+static int chart_check(const Chart *c, const float *sh, const unsigned char *shg,
+                       int shn, FILE *log, const char *tag, float tsim,
+                       int *phantom)
+{
+    int bad = 0;
+    for (int i = 0; i < c->count; i++) {
+        int ring = (c->head - c->count + i + CHART_N) % CHART_N;
+        float expect = sh[shn - c->count + i];
+        if (c->y[ring] != expect) {
+            bad++;
+            if (log && bad <= 5)
+                fprintf(log, "[%s t=%.2f] MISMATCH i=%d ring=%d got=%.3f want=%.3f "
+                        "head=%d count=%d\n", tag, tsim, i, ring,
+                        (double)c->y[ring], (double)expect, c->head, c->count);
+        }
+        if (c->y[ring] <= 0.05f && !shg[shn - c->count + i]) {
+            (*phantom)++;
+            if (log && *phantom <= 5)
+                fprintf(log, "[%s t=%.2f] PHANTOM ZERO i=%d ring=%d head=%d\n",
+                        tag, tsim, i, ring, c->head);
+        }
+    }
+    return bad;
+}
+
+#define SH_MAX 20000
+static float sh_y[SH_MAX];
+static unsigned char sh_g[SH_MAX];
+
 // Signed horizontal bar for one controller term, centered at cx.
 static void term_bar(const char *label, float value, int cx, int y, Color col)
 {
@@ -96,10 +128,12 @@ static void term_bar(const char *label, float value, int cx, int y, Color col)
     DrawText(TextFormat("%+7.2f N", value), cx + 48, y, 18, col);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    bool selftest = (argc > 1) && (strcmp(argv[1], "--selftest") == 0);
+
     InitWindow(SCREEN_W, SCREEN_H, "PID Lander");
-    SetTargetFPS(60);
+    SetTargetFPS(selftest ? 0 : 60);   // selftest: run sim time flat out
 
     SimState sim;
     sim_reset(&sim);
@@ -165,10 +199,20 @@ int main(void)
     float acc = 0.0f;                // physics time accumulator [s]
     float t_sim = 0.0f;              // simulated time [s], drives the gusts
 
+    int sh_n = 0, st_mismatch = 0, st_phantom = 0;
+    FILE *stlog = NULL;
+    if (selftest) {
+        stlog = fopen("selftest.log", "w");
+        paused = false;
+        launched = true;
+        pid_on = true;               // fly a sinusoidal setpoint autonomously
+    }
+
     while (!WindowShouldClose()) {
         // ---------- input ----------
-        float frame = GetFrameTime();
+        float frame = selftest ? (1.0f / 60.0f) : GetFrameTime();
         if (frame > 0.25f) frame = 0.25f;   // clamp: no spiral of death
+        if (selftest) setpoint = 50.0f + 25.0f * sinf(0.15f * t_sim);
 
         if (IsKeyPressed(KEY_R)) {
             sim_reset(&sim);
@@ -307,9 +351,18 @@ int main(void)
                     chart_push(&chart, sim.y, setpoint, sim.u, sim.wind, sim.v,
                                push_flags);
                     push_flags = 0;
+                    if (selftest && sh_n < SH_MAX) {
+                        sh_y[sh_n] = sim.y;
+                        sh_g[sh_n] = (sim.y <= 0.05f);
+                        sh_n++;
+                    }
                 }
             }
         }
+
+        if (selftest && sh_n > 0)
+            st_mismatch += chart_check(&chart, sh_y, sh_g, sh_n, stlog,
+                                       "post-physics", t_sim, &st_phantom);
 
         // ---------- render ----------
         BeginDrawing();
@@ -628,7 +681,23 @@ int main(void)
                  "SPACE: manual thrust   R: reset",
                  CHART_X + 2, SCREEN_H - 30, 17, LIGHTGRAY);
 
+        if (selftest && sh_n > 0)
+            st_mismatch += chart_check(&chart, sh_y, sh_g, sh_n, stlog,
+                                       "post-render", t_sim, &st_phantom);
+
         EndDrawing();
+
+        if (selftest && t_sim > 75.0f) break;   // ~3.7 ring wraparounds
+    }
+
+    if (selftest) {
+        printf("SELFTEST: pushes=%d mismatches=%d phantom_zeros=%d\n",
+               sh_n, st_mismatch, st_phantom);
+        if (stlog) {
+            fprintf(stlog, "SELFTEST: pushes=%d mismatches=%d phantom_zeros=%d\n",
+                    sh_n, st_mismatch, st_phantom);
+            fclose(stlog);
+        }
     }
 
     CloseWindow();

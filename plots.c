@@ -313,7 +313,11 @@ void step_predict(StepPred *sp, float m, float kp, float ki, float kd,
                   ThrustProf prof)
 {
     const float dt = 1.0f / 120.0f;
-    const int n = (int)(STEP_T / dt);
+    // Round, don't truncate: STEP_T/dt in float is 1199.9995..., and the
+    // truncated 1199 made sub=4, so curve[i/sub] ran 60 slots past the end
+    // of the array — corrupting whatever the stack placed after it (it was
+    // the history chart's altitude ring).
+    const int n = (int)(STEP_T / dt + 0.5f);
     const int sub = n / STEP_N;
     float y = 0.0f, v = 0.0f, integ = 0.0f, dfilt = 0.0f, prevy = 0.0f, uact = 0.0f;
 
@@ -331,7 +335,7 @@ void step_predict(StepPred *sp, float m, float kp, float ki, float kd,
         v += (uact - DRAG * v) / m * dt;
         y += v * dt;
 
-        if (i % sub == 0) sp->curve[i / sub] = y;
+        if (i % sub == 0 && i / sub < STEP_N) sp->curve[i / sub] = y;
         if (y - 1.0f > sp->ov_pct) sp->ov_pct = y - 1.0f;
         if (fabsf(1.0f - y) > 0.02f) sp->settle = -1.0f;
         else if (sp->settle < 0.0f) sp->settle = (float)i * dt;
