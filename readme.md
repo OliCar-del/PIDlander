@@ -2,11 +2,17 @@
 
 A real-time 1-D flight control sandbox written in C99, built to demonstrate end-to-end classical control theory and deterministic simulation techniques.
 
+![dashboard](loadscreen.png "Paused pre-launch screen")
+<span style="font-size: 14px">Figure 1; Prelaunch screen with telemetry panels and PID control windows. Lander is simple white rectangle at image centre. Aim to control altitude settling with Kp, Kd and Ki.</span>
+
 ## Overview
 
 PIDlander presents an interactive lunar-lander environment where thrust is governed by a user-designed PID controller. The primary constraint is a one-sided actuator (`u ≥ 0`); the controller possesses no downward authority other than gravity. This asymmetry necessitates a robust controller design to handle routine saturation, asymmetric overshoot recovery, and variable plant dynamics (mass, wind disturbances, sensor noise, and actuator lag).
 
 The physics simulation runs on a decoupled, fixed 120 Hz timestep using semi-implicit Euler integration to prevent the slow energy injection typical of explicit methods, ensuring the numerical stability required for marginal-stability experiments. Rendering and UI are handled via `raylib`.
+
+![gameplay](exampleplay.gif "stepping through PID, play, landing and control")
+<span style="font-size: 14px">Figure 2; Brief sample of gameplay. Game is started with button press and manually controlled by user-presses on spacebar by default. PID control can be started by pressing 'P'. Default control gains can be altered with panel at right, as well as wind strength, mass accuracy, gravity and more. Bottom right panel shows sequence (click and drag) altitude setting, started by pressing play. Error and effort of control scheme are displayed at left once sequence has concluded. Plot type can be changed between root locus, bode, phase and step response. Messages are displayed for successful landing or crash. Restart with R.</span>
 
 ## Core Technical Features
 
