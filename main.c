@@ -529,15 +529,15 @@ int main(int argc, char **argv)
         // ---- wind streaks (vertical: the gust acts along the flight axis;
         //      speed, length and opacity all scale with the gust force) ----
         if (wind_on && fabsf(sim.wind) > STREAK_MIN_N) {
-            float alpha = clampf(0.15f + fabsf(sim.wind) / 15.0f, 0.15f, 0.8f);
-            float len   = clampf(8.0f + fabsf(sim.wind) * 1.2f, 8.0f, 70.0f);
-            float dir   = (sim.wind > 0.0f) ? 1.0f : -1.0f;
+            float alpha = clampf(0.15f + fabsf(sim.wind) / 15.0f, 0.15f, 0.8f); // opacity
+            float len   = clampf(8.0f + fabsf(sim.wind) * 1.2f, 8.0f, 70.0f); // streak length
+            float dir   = (sim.wind > 0.0f) ? 1.0f : -1.0f; // streak direction
             for (int i = 0; i < WPART; i++) {
-                wpy[i] += sim.wind * STREAK_PX_PER_N * frame;
+                wpy[i] -= sim.wind * STREAK_PX_PER_N * frame;
                 if (wpy[i] > (float)VIEW_Y1) wpy[i] -= (float)(VIEW_Y1 - VIEW_Y0);
                 if (wpy[i] < (float)VIEW_Y0) wpy[i] += (float)(VIEW_Y1 - VIEW_Y0);
                 DrawLineV((Vector2){ wpx[i], wpy[i] },
-                          (Vector2){ wpx[i], wpy[i] - dir * len },
+                          (Vector2){ wpx[i], wpy[i] + dir * len },
                           Fade(PURPLE, alpha));
             }
         }

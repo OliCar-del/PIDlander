@@ -31,7 +31,7 @@
 #define UMAX_DEF    50.0f            // default max thrust [N]
 #define UMAX_TOP    100.0f           // max-thrust slider ceiling [N]
 #define WORLD_H     100.0f           // visible altitude range [m]
-#define START_Y     50.0f            // spawn altitude [m]
+#define START_Y     40.0f            // spawn altitude [m]
 #define VCRASH_DEF  5.0f             // default crash touchdown speed [m/s]
 #define FRAME_CLAMP 0.25f            // longest frame the accumulator accepts [s]
 
