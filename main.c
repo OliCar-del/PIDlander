@@ -4,129 +4,41 @@
 // Integrated with semi-implicit Euler at a fixed 120 Hz, decoupled from the
 // render rate by an accumulator loop.
 //
-// The controller outputs u_cmd = u_ff + PID(e), where u_ff is gravity
-// feedforward using the *estimated* mass (the "mass estimate x" slider lies
-// to the controller; the integral term absorbs the model error). The command
-// passes through a selectable actuator response — INSTANT, LAG (first-order),
-// or SLEW (rate-limited) — before becoming applied thrust. The controller
-// measures altitude through optional Gaussian sensor noise. Touching down
-// faster than the crash-speed slider destroys the craft (R to reset).
+// Modules:
+//   config.h   — every constant and layout coordinate
+//   util       — clampf / frand / gauss
+//   sim        — plant dynamics, actuator response, wind gusts
+//   pid        — the controller (anti-windup, derivative-on-measurement,
+//                filtered derivative, bumpless live tuning)
+//   chart      — 20 s history strips (altitude/setpoint over thrust/wind)
+//   seq        — draggable stepped target-sequence editor with playback
+//   plots      — root locus / Bode + Routh verdict / phase portrait /
+//                predicted step response
+//   autotune   — relay experiment measuring Ku/Tu for tuning rules
+//   ui         — immediate-mode sliders and buttons
 //
-// Instruments:
-//   - strip chart (bottom left): altitude / setpoint / thrust / wind, 20 s
-//   - analysis plot (bottom middle, L to cycle): root locus / Bode with
-//     margins and an exact Routh stability verdict / phase portrait /
-//     predicted linear step response for the current gains
-//   - target sequence editor (bottom right): draggable numbered points make a
-//     stepped setpoint profile; PLAY runs it on sim time
-//   - tracking scores (left panel): each playback records IAE, ITAE, max
-//     error, and control effort (sum |du|) so tunes can be compared
-//   - model vs reality (right panel): zeta/wn from the gains, predicted step
-//     metrics, and measured overshoot/settle from the last real setpoint step
-//   - AUTOTUNE: relay (Astrom-Hagglund) experiment measures Ku and Tu, then
-//     rule buttons apply Ziegler-Nichols PID/PI or Tyreus-Luyben gains
+// main.c owns the game loop: input, the fixed-timestep physics loop, the
+// controller wiring (feedforward + PID through the actuator), playback
+// scoring, and panel layout.
 //
 // Keys:  P PID on/off | W wind | ENTER pause | UP/DOWN or click view: setpoint
 //        SPACE manual thrust | L cycle plot | R reset
 
-#include "raylib.h"
-#include <complex.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 
+#include "raylib.h"
+
+#include "autotune.h"
+#include "chart.h"
+#include "config.h"
 #include "pid.h"
+#include "plots.h"
+#include "seq.h"
+#include "sim.h"
 #include "ui.h"
-
-// ---------- simulation constants ----------
-#define SIM_DT      (1.0f / 120.0f)  // fixed physics timestep [s]
-#define MASS_DEF    1.0f             // default craft mass [kg]
-#define G_DEF       9.81f            // default gravity [m/s^2]
-#define DRAG        0.15f            // linear drag coefficient [N*s/m]
-#define UMAX_DEF    50.0f            // default max thrust [N]
-#define UMAX_TOP    100.0f           // max-thrust slider ceiling [N]
-#define WORLD_H     100.0f           // visible altitude range [m]
-#define START_Y     50.0f            // spawn altitude [m]
-#define VCRASH_DEF  5.0f             // default crash touchdown speed [m/s]
-
-// ---------- actuator response ----------
-typedef enum { TP_INSTANT, TP_LAG, TP_SLEW } ThrustProf;
-static const char *PROF_LABEL[3] = { "INSTANT", "LAG", "SLEW" };
-#define ACT_TAU     0.2f             // LAG: first-order time constant [s]
-#define ACT_SLEW    60.0f            // SLEW: max thrust rate [N/s]
-
-// ---------- controller constants ----------
-#define KP_DEF      4.0f
-#define KI_DEF      0.5f
-#define KD_DEF      4.0f
-#define KP_TOP      50.0f            // slider ceilings
-#define KI_TOP      20.0f
-#define KD_TOP      30.0f
-#define D_TAU       0.05f            // derivative low-pass time constant [s]
-#define SP_START    50.0f            // initial setpoint [m]
-#define SP_RATE     15.0f            // setpoint slew from arrow keys [m/s]
-#define NOISE_TOP   2.0f             // sensor noise sigma slider ceiling [m]
-
-// ---------- wind gust constants ----------
-#define GUST_GAP_MIN  2.0f           // quiet time between gusts [s]
-#define GUST_GAP_MAX  6.0f
-#define GUST_DUR_MIN  1.0f           // gust duration [s]
-#define GUST_DUR_MAX  2.0f
-#define WIND_AMP_MAX  50.0f          // slider ceiling for peak gust force [N]
-
-// ---------- layout ----------
-#define SCREEN_W    1600
-#define SCREEN_H    1000
-#define TITLE_H     48
-
-#define LPAN_X      8                // telemetry panel (left)
-#define LPAN_Y      56
-#define LPAN_W      356
-#define LPAN_H      640
-
-#define VIEW_X0     372              // flight view (center)
-#define VIEW_X1     1128
-#define VIEW_Y0     56
-#define VIEW_Y1     696
-#define MARGIN_PX   40               // padding above 100 m and below 0 m
-#define CRAFT_W_PX  30
-#define CRAFT_H_PX  40
-
-#define RPAN_X      1136             // controller panel (right)
-#define RPAN_Y      56
-#define RPAN_W      456
-#define RPAN_H      640
-
-// ---------- strip chart (bottom left) ----------
-#define CHART_N     600              // samples in the ring buffer
-#define CHART_HZ    30               // sample rate -> 20 s window
-#define CHART_X     8
-#define CHART_Y     704
-#define CHART_W     852
-#define CHART_HGT   240
-
-// ---------- analysis plot (bottom middle) ----------
-#define PLOT_X      868
-#define PLOT_Y      704
-#define PLOT_W      356
-#define PLOT_HGT    240
-
-// ---------- target sequence editor (bottom right) ----------
-#define SEQ_MAX     10
-#define SEQ_PX      1232             // panel
-#define SEQ_PY      704
-#define SEQ_PW      360
-#define SEQ_PH      240
-#define SEQ_GX      1242             // graph area inside the panel
-#define SEQ_GY      770
-#define SEQ_GW      340
-#define SEQ_GH      164
-
-// ---------- run scores ----------
-#define SCORE_KEEP  4                // rows shown in the panel
-
-// ---------- wind streak animation ----------
-#define WPART       28
+#include "util.h"
 
 // controller structure: which terms are active
 typedef enum { CM_P, CM_PI, CM_PD, CM_PID } CtrlMode;
@@ -134,50 +46,6 @@ static const char *MODE_LABEL[4] = { "P", "PI", "PD", "PID" };
 
 typedef enum { PLOT_OFF, PLOT_LOCUS, PLOT_BODE, PLOT_PHASE, PLOT_STEP } PlotMode;
 static const char *PLOT_LABEL[5] = { "OFF", "LOCUS", "BODE", "PHASE", "STEP" };
-
-typedef struct SimState {
-    float y;        // altitude [m], up is positive, 0 = ground
-    float v;        // vertical velocity [m/s]
-    float u;        // applied thrust [N] (actuator output)
-    float wind;     // current gust force [N], set by the gust model
-    bool  landed;   // resting on the ground (gently)
-    bool  crashed;  // touched down above the crash speed
-    float impact;   // touchdown speed of the crash [m/s]
-} SimState;
-
-// Randomized smooth gust generator: quiet gap, then a (1-cos)/2 pulse.
-typedef struct Gust {
-    float t_next;   // sim time when the next gust starts [s]
-    float t_start;  // start time of the active gust [s]
-    float dur;      // duration of the active gust [s]
-    float amp;      // signed peak force of the active gust [N]
-    bool  active;
-} Gust;
-
-typedef struct Chart {
-    float y[CHART_N];
-    float sp[CHART_N];
-    float u[CHART_N];
-    float w[CHART_N];
-    float v[CHART_N];
-    int head;       // next write slot
-    int count;      // valid samples so far (saturates at CHART_N)
-    int div;        // physics-step divider for the sample rate
-} Chart;
-
-// Stepped setpoint sequence: numbered points (time, height), sorted in time;
-// the setpoint holds `base` until point 1, then holds each point's height
-// until the next point's time.
-typedef struct Seq {
-    int   n;              // active points
-    float T;              // timeframe [s]
-    float t[SEQ_MAX];     // point times [s], kept ordered
-    float y[SEQ_MAX];     // point heights [m]
-    bool  playing;
-    float t_play;         // playback clock [s], advances with sim time
-    float base;           // setpoint captured when PLAY was pressed
-    int   drag;           // point index being dragged, -1 = none
-} Seq;
 
 // One scored playback of the target sequence.
 typedef struct Score {
@@ -190,33 +58,6 @@ typedef struct Score {
     float effort;   // sum of |thrust change|          [N]
 } Score;
 
-// Relay (Astrom-Hagglund) autotune experiment state.
-typedef struct Autotune {
-    bool  running;
-    float d;            // relay amplitude [N]
-    float h;            // switching hysteresis [m]
-    int   sign;         // current relay output sign
-    int   ups;          // up-switch count (first two = transient, skipped)
-    float last_up_t;    // sim time of the previous counted up-switch
-    float periods[4];
-    int   np;
-    float ymin, ymax;   // oscillation envelope during the measuring window
-    float t_start;
-    float ku, tu;       // measured ultimate gain/period (0 until measured)
-    char  result[96];
-    float result_t;     // sim time the result banner was set
-} Autotune;
-
-// Predicted linear closed-loop unit-step response for the current gains.
-#define STEP_N 240
-#define STEP_T 10.0f
-typedef struct StepPred {
-    float curve[STEP_N];
-    float ov_pct;       // peak overshoot [%]
-    float settle;       // 2% settling time [s], -1 if none inside STEP_T
-    bool  diverged;
-} StepPred;
-
 // Measurement of the last real setpoint step flown by the craft.
 typedef struct StepMeas {
     bool  seen;         // any step measured yet
@@ -226,93 +67,6 @@ typedef struct StepMeas {
     float ov;           // overshoot fraction of |step|
     float settle;       // 2% settling time [s], -1 while outside the band
 } StepMeas;
-
-static float clampf(float v, float lo, float hi)
-{
-    if (v < lo) return lo;
-    if (v > hi) return hi;
-    return v;
-}
-
-static float frand(float lo, float hi)
-{
-    return lo + (hi - lo) * (float)GetRandomValue(0, 10000) / 10000.0f;
-}
-
-// Standard normal via Box-Muller.
-static float gauss(void)
-{
-    float u1 = frand(1e-6f, 1.0f), u2 = frand(0.0f, 1.0f);
-    return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * PI * u2);
-}
-
-static float gust_force(Gust *g, float t, float amp_scale)
-{
-    if (!g->active) {
-        if (t < g->t_next) return 0.0f;
-        g->active = true;
-        g->t_start = t;
-        g->dur = frand(GUST_DUR_MIN, GUST_DUR_MAX);
-        g->amp = frand(0.5f, 1.0f) * amp_scale
-               * (GetRandomValue(0, 1) ? 1.0f : -1.0f);
-    }
-    float ph = (t - g->t_start) / g->dur;
-    if (ph >= 1.0f) {
-        g->active = false;
-        g->t_next = t + frand(GUST_GAP_MIN, GUST_GAP_MAX);
-        return 0.0f;
-    }
-    return g->amp * 0.5f * (1.0f - cosf(2.0f * PI * ph));
-}
-
-static void sim_reset(SimState *s)
-{
-    s->y = START_Y;
-    s->v = 0.0f;
-    s->u = 0.0f;
-    s->wind = 0.0f;
-    s->landed = false;
-    s->crashed = false;
-    s->impact = 0.0f;
-}
-
-// One fixed physics step: semi-implicit Euler (velocity first, then position).
-static void sim_step(SimState *s, float m, float g, float vcrash, float dt)
-{
-    float a = (s->u - m * g - DRAG * s->v + s->wind) / m;
-    s->v += a * dt;
-    s->y += s->v * dt;
-
-    if (s->y <= 0.0f) {              // ground contact
-        if (!s->crashed && s->v < -vcrash) {
-            s->crashed = true;
-            s->impact = -s->v;
-        }
-        s->y = 0.0f;
-        if (s->v < 0.0f) s->v = 0.0f;
-        s->landed = !s->crashed && (s->u <= m * g);
-    } else {
-        s->landed = false;
-    }
-}
-
-// Actuator response: applied thrust chases the command per the profile.
-static float actuate(float u_act, float u_cmd, ThrustProf prof, float dt)
-{
-    switch (prof) {
-    case TP_LAG:
-        return u_act + (u_cmd - u_act) * dt / (ACT_TAU + dt);
-    case TP_SLEW: {
-        float du = u_cmd - u_act;
-        float lim = ACT_SLEW * dt;
-        if (du > lim)  du = lim;
-        if (du < -lim) du = -lim;
-        return u_act + du;
-    }
-    default:
-        return u_cmd;
-    }
-}
 
 // World-to-screen: altitude in meters (up) -> pixel row (down), and back.
 static int world_to_px(float y)
@@ -326,561 +80,6 @@ static float px_to_world(float py)
     float t = ((float)(VIEW_Y1 - MARGIN_PX) - py)
             / (float)(VIEW_Y1 - VIEW_Y0 - 2 * MARGIN_PX);
     return clampf(t * WORLD_H, 0.0f, WORLD_H);
-}
-
-// ---------- strip chart ----------
-
-static void chart_push(Chart *c, float y, float sp, float u, float w, float v)
-{
-    c->y[c->head] = y;
-    c->sp[c->head] = sp;
-    c->u[c->head] = u;
-    c->w[c->head] = w;
-    c->v[c->head] = v;
-    c->head = (c->head + 1) % CHART_N;
-    if (c->count < CHART_N) c->count++;
-}
-
-// Altitude in meters -> pixel row inside the chart area.
-static float chart_py(float val)
-{
-    val = clampf(val, 0.0f, WORLD_H);
-    return (float)(CHART_Y + CHART_HGT) - val / WORLD_H * (float)CHART_HGT;
-}
-
-static void chart_draw(const Chart *c, float u_max)
-{
-    DrawRectangle(CHART_X, CHART_Y, CHART_W, CHART_HGT, (Color){ 16, 21, 36, 255 });
-    DrawRectangleLines(CHART_X, CHART_Y, CHART_W, CHART_HGT, DARKGRAY);
-    for (int m = 0; m <= 100; m += 25) {
-        int py = (int)chart_py((float)m);
-        DrawLine(CHART_X, py, CHART_X + CHART_W, py, Fade(DARKGRAY, 0.5f));
-        DrawText(TextFormat("%d", m), CHART_X + 6, py - 12, 12, DARKGRAY);
-    }
-    DrawText("HISTORY - last 20 s", CHART_X + CHART_W - 140, CHART_Y + 6, 14, GRAY);
-
-    float dx = (float)CHART_W / (float)(CHART_N - 1);
-    for (int i = 1; i < c->count; i++) {
-        int i0 = (c->head - c->count + i - 1 + CHART_N) % CHART_N;
-        int i1 = (i0 + 1) % CHART_N;
-        float x0 = (float)CHART_X + (float)(i - 1) * dx;
-        float x1 = (float)CHART_X + (float)i * dx;
-        // thrust rescaled to the live [0,u_max], wind centered on the 50 m line
-        DrawLineV((Vector2){ x0, chart_py(c->u[i0] / u_max * WORLD_H) },
-                  (Vector2){ x1, chart_py(c->u[i1] / u_max * WORLD_H) },
-                  Fade(ORANGE, 0.35f));
-        DrawLineV((Vector2){ x0, chart_py(50.0f + c->w[i0] * (50.0f / WIND_AMP_MAX)) },
-                  (Vector2){ x1, chart_py(50.0f + c->w[i1] * (50.0f / WIND_AMP_MAX)) },
-                  Fade(PURPLE, 0.5f));
-        DrawLineV((Vector2){ x0, chart_py(c->sp[i0]) },
-                  (Vector2){ x1, chart_py(c->sp[i1]) }, SKYBLUE);
-        DrawLineV((Vector2){ x0, chart_py(c->y[i0]) },
-                  (Vector2){ x1, chart_py(c->y[i1]) }, RAYWHITE);
-    }
-    int ly = CHART_Y + CHART_HGT - 20;
-    DrawText("altitude", CHART_X + 10,  ly, 14, RAYWHITE);
-    DrawText("setpoint", CHART_X + 80,  ly, 14, SKYBLUE);
-    DrawText(TextFormat("thrust (0-%.0f N)", u_max), CHART_X + 152, ly, 14,
-             Fade(ORANGE, 0.8f));
-    DrawText(TextFormat("wind (+-%.0f N)", WIND_AMP_MAX), CHART_X + 290, ly, 14,
-             Fade(PURPLE, 0.9f));
-}
-
-// ---------- target sequence ----------
-
-// Keep points inside the timeframe/world and ordered in time.
-static void seq_normalize(Seq *q)
-{
-    for (int i = 0; i < q->n; i++) {
-        if (q->t[i] < 0.05f)  q->t[i] = 0.05f;
-        if (i > 0 && q->t[i] < q->t[i - 1] + 0.1f) q->t[i] = q->t[i - 1] + 0.1f;
-        if (q->t[i] > q->T)   q->t[i] = q->T;
-        q->y[i] = clampf(q->y[i], 0.0f, WORLD_H);
-    }
-}
-
-// Stepped profile: hold base until point 1, then each height until the next.
-static float seq_eval(const Seq *q, float t)
-{
-    float sp = q->base;
-    for (int i = 0; i < q->n; i++) {
-        if (t >= q->t[i]) sp = q->y[i];
-        else break;
-    }
-    return sp;
-}
-
-static float seq_sx(const Seq *q, float t)
-{
-    return (float)SEQ_GX + t / q->T * (float)SEQ_GW;
-}
-
-static float seq_sy(float y)
-{
-    return (float)(SEQ_GY + SEQ_GH) - y / WORLD_H * (float)SEQ_GH;
-}
-
-// Draw the editor panel and handle its widgets and point dragging.
-// live_setpoint is the current target (baseline of the profile when idle).
-static void seq_panel(Seq *q, float live_setpoint)
-{
-    DrawRectangleLines(SEQ_PX, SEQ_PY, SEQ_PW, SEQ_PH, DARKGRAY);
-    DrawText("TARGET SEQUENCE", SEQ_PX + 12, SEQ_PY + 8, 16, GRAY);
-
-    if (ui_button((Rectangle){ SEQ_PX + SEQ_PW - 88, SEQ_PY + 5, 80, 24 },
-                  q->playing ? "STOP" : "PLAY", q->playing)) {
-        q->playing = !q->playing;
-        if (q->playing) {
-            q->t_play = 0.0f;
-            q->base = live_setpoint;
-        }
-    }
-
-    // point count and timeframe; times rescale proportionally with T
-    float nf = ui_slider(11, SEQ_PX + 12, SEQ_PY + 30, 150, "points",
-                         (float)q->n, 2.0f, (float)SEQ_MAX, "%.0f");
-    q->n = (int)(nf + 0.5f);
-    float newT = ui_slider(12, SEQ_PX + 186, SEQ_PY + 30, 160, "seconds",
-                           q->T, 5.0f, 60.0f, "%.0f");
-    if (fabsf(newT - q->T) > 1e-6f) {
-        float scale = newT / q->T;
-        for (int i = 0; i < SEQ_MAX; i++) q->t[i] *= scale;
-        q->T = newT;
-    }
-
-    // graph frame
-    DrawRectangle(SEQ_GX, SEQ_GY, SEQ_GW, SEQ_GH, (Color){ 16, 21, 36, 255 });
-    DrawRectangleLines(SEQ_GX, SEQ_GY, SEQ_GW, SEQ_GH, DARKGRAY);
-    int mid = (int)seq_sy(50.0f);
-    DrawLine(SEQ_GX, mid, SEQ_GX + SEQ_GW, mid, Fade(DARKGRAY, 0.5f));
-    DrawText("0", SEQ_GX + 4, SEQ_GY + SEQ_GH - 14, 12, DARKGRAY);
-    DrawText(TextFormat("%.0fs", q->T), SEQ_GX + SEQ_GW - 28, SEQ_GY + SEQ_GH - 14, 12, DARKGRAY);
-    DrawText("50m", SEQ_GX + 4, mid - 14, 12, DARKGRAY);
-
-    // point dragging (allowed even while playing — the profile is live)
-    Vector2 mp = GetMousePosition();
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !ui_dragging()) {
-        for (int i = 0; i < q->n; i++) {
-            float dxp = mp.x - seq_sx(q, q->t[i]);
-            float dyp = mp.y - seq_sy(q->y[i]);
-            if (dxp * dxp + dyp * dyp < 121.0f) { q->drag = i; break; }
-        }
-    }
-    if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) q->drag = -1;
-    if (q->drag >= 0) {
-        q->t[q->drag] = (mp.x - (float)SEQ_GX) / (float)SEQ_GW * q->T;
-        q->y[q->drag] = ((float)(SEQ_GY + SEQ_GH) - mp.y) / (float)SEQ_GH * WORLD_H;
-    }
-    seq_normalize(q);
-
-    // stepped profile: horizontal holds with faint vertical connectors
-    float base = q->playing ? q->base : live_setpoint;
-    float prev_y = base;
-    float prev_x = (float)SEQ_GX;
-    for (int i = 0; i <= q->n; i++) {
-        float seg_end = (i < q->n) ? seq_sx(q, q->t[i]) : (float)(SEQ_GX + SEQ_GW);
-        DrawLineV((Vector2){ prev_x, seq_sy(prev_y) },
-                  (Vector2){ seg_end, seq_sy(prev_y) }, GOLD);
-        if (i < q->n) {
-            DrawLineV((Vector2){ seg_end, seq_sy(prev_y) },
-                      (Vector2){ seg_end, seq_sy(q->y[i]) }, Fade(GOLD, 0.35f));
-            prev_y = q->y[i];
-            prev_x = seg_end;
-        }
-    }
-
-    // numbered points
-    for (int i = 0; i < q->n; i++) {
-        float px = seq_sx(q, q->t[i]), py = seq_sy(q->y[i]);
-        DrawCircleV((Vector2){ px, py }, 6.0f, (q->drag == i) ? RAYWHITE : SKYBLUE);
-        DrawText(TextFormat("%d", i + 1), (int)px + 7, (int)py - 16, 12, LIGHTGRAY);
-    }
-
-    // playback cursor
-    if (q->playing) {
-        float cx = seq_sx(q, q->t_play);
-        DrawLineV((Vector2){ cx, (float)SEQ_GY }, (Vector2){ cx, (float)(SEQ_GY + SEQ_GH) },
-                  Fade(RED, 0.8f));
-        DrawText(TextFormat("t = %.1f s", q->t_play), SEQ_GX + SEQ_GW - 80, SEQ_GY + 6, 12, RED);
-    }
-}
-
-// ---------- root locus ----------
-
-// a*s^2 + b*s + c = 0
-static void solve_quadratic(double a, double b, double c, double re[2], double im[2])
-{
-    double disc = b * b - 4.0 * a * c;
-    if (disc >= 0.0) {
-        double r = sqrt(disc);
-        re[0] = (-b + r) / (2.0 * a); im[0] = 0.0;
-        re[1] = (-b - r) / (2.0 * a); im[1] = 0.0;
-    } else {
-        double r = sqrt(-disc);
-        re[0] = re[1] = -b / (2.0 * a);
-        im[0] = r / (2.0 * a);
-        im[1] = -im[0];
-    }
-}
-
-// a*s^3 + b*s^2 + c*s + d = 0 (a != 0), via depressed cubic + Cardano/trig.
-static void solve_cubic(double a, double b, double c, double d,
-                        double re[3], double im[3])
-{
-    double p = b / a, q = c / a, r = d / a;
-    double P = q - p * p / 3.0;
-    double Q = 2.0 * p * p * p / 27.0 - p * q / 3.0 + r;
-    double shift = -p / 3.0;
-    double D = Q * Q / 4.0 + P * P * P / 27.0;
-
-    if (D > 1e-12) {                 // one real root + complex pair
-        double sq = sqrt(D);
-        double u = cbrt(-Q / 2.0 + sq), v = cbrt(-Q / 2.0 - sq);
-        re[0] = u + v + shift;            im[0] = 0.0;
-        re[1] = -(u + v) / 2.0 + shift;   im[1] = (u - v) * sqrt(3.0) / 2.0;
-        re[2] = re[1];                    im[2] = -im[1];
-    } else if (D < -1e-12) {         // three distinct real roots
-        double rho = sqrt(-P * P * P / 27.0);
-        double arg = -Q / (2.0 * rho);
-        if (arg > 1.0) arg = 1.0;
-        if (arg < -1.0) arg = -1.0;
-        double theta = acos(arg);
-        double mag = 2.0 * sqrt(-P / 3.0);
-        for (int k = 0; k < 3; k++) {
-            re[k] = mag * cos((theta + 2.0 * PI * (double)k) / 3.0) + shift;
-            im[k] = 0.0;
-        }
-    } else {                         // repeated roots
-        double u = cbrt(-Q / 2.0);
-        re[0] = 2.0 * u + shift;
-        re[1] = re[2] = -u + shift;
-        im[0] = im[1] = im[2] = 0.0;
-    }
-}
-
-// Closed-loop poles for m*s^3 + (c+Kd)*s^2 + Kp*s + Ki = 0 (2nd order if Ki=0).
-static int poles(double m, double drag, double kp, double ki, double kd,
-                 double re[3], double im[3])
-{
-    if (ki > 1e-6) {
-        solve_cubic(m, drag + kd, kp, ki, re, im);
-        return 3;
-    }
-    solve_quadratic(m, drag + kd, kp, re, im);
-    return 2;
-}
-
-static void locus_draw(int lx, int ly, int lw, int lh,
-                       float m, float kp, float ki, float kd)
-{
-    const double RE_MIN = -9.0, RE_MAX = 3.0, IM_MAX = 6.0;
-
-    DrawRectangle(lx, ly, lw, lh, (Color){ 16, 21, 36, 255 });
-    DrawRectangleLines(lx, ly, lw, lh, DARKGRAY);
-
-    // unstable half-plane shading + axes
-    int x_zero = lx + (int)((0.0 - RE_MIN) / (RE_MAX - RE_MIN) * (double)lw);
-    int y_zero = ly + lh / 2;
-    DrawRectangle(x_zero, ly, lx + lw - x_zero, lh, Fade(RED, 0.10f));
-    DrawLine(x_zero, ly, x_zero, ly + lh, Fade(RED, 0.6f));
-    DrawLine(lx, y_zero, lx + lw, y_zero, Fade(DARKGRAY, 0.8f));
-
-    // branches: sweep Kp with Ki, Kd held at current values
-    double re[3], im[3];
-    for (int i = 1; i <= 300; i++) {
-        double k = (double)KP_TOP * (double)i / 300.0;
-        int n = poles(m, DRAG, k, ki, kd, re, im);
-        for (int j = 0; j < n; j++) {
-            if (re[j] < RE_MIN || re[j] > RE_MAX || fabs(im[j]) > IM_MAX) continue;
-            int px = lx + (int)((re[j] - RE_MIN) / (RE_MAX - RE_MIN) * (double)lw);
-            int py = ly + (int)((IM_MAX - im[j]) / (2.0 * IM_MAX) * (double)lh);
-            DrawCircle(px, py, 1.2f, Fade(LIME, 0.45f));
-        }
-    }
-
-    // current poles as X marks; red once in the right half-plane
-    int n = poles(m, DRAG, kp, ki, kd, re, im);
-    for (int j = 0; j < n; j++) {
-        if (re[j] < RE_MIN || re[j] > RE_MAX || fabs(im[j]) > IM_MAX) continue;
-        int px = lx + (int)((re[j] - RE_MIN) / (RE_MAX - RE_MIN) * (double)lw);
-        int py = ly + (int)((IM_MAX - im[j]) / (2.0 * IM_MAX) * (double)lh);
-        Color col = (re[j] > 1e-6) ? RED : YELLOW;
-        DrawLine(px - 5, py - 5, px + 5, py + 5, col);
-        DrawLine(px - 5, py + 5, px + 5, py - 5, col);
-    }
-
-    DrawText(TextFormat("ROOT LOCUS: poles vs Kp 0..%.0f (Ki, Kd held)", KP_TOP),
-             lx + 8, ly + 6, 13, LIGHTGRAY);
-    DrawText("s-plane; filter/actuator/sampling ignored", lx + 8, ly + 22, 12, DARKGRAY);
-    DrawText("Re=0", x_zero + 4, ly + lh - 16, 12, Fade(RED, 0.8f));
-}
-
-// Generic Routh-Hurwitz test: coefficients in descending powers, degree deg.
-// Returns true iff all roots are strictly in the left half-plane.
-static bool routh_stable(const double *coef, int deg)
-{
-    double a[8] = { 0 }, b[8] = { 0 }, c[8] = { 0 };
-    int w = deg / 2 + 1;
-    for (int i = 0; 2 * i <= deg; i++)     a[i] = coef[2 * i];
-    for (int i = 0; 2 * i + 1 <= deg; i++) b[i] = coef[2 * i + 1];
-    for (int i = 0; i <= deg; i++)
-        if (coef[i] <= 0.0) return false;  // necessary: all same sign
-    for (int row = 0; row < deg - 1; row++) {
-        if (b[0] <= 0.0) return false;
-        for (int j = 0; j < w - 1; j++)
-            c[j] = (b[0] * a[j + 1] - a[0] * b[j + 1]) / b[0];
-        c[w - 1] = 0.0;
-        for (int j = 0; j < w; j++) { a[j] = b[j]; b[j] = c[j]; }
-    }
-    return b[0] > 0.0;
-}
-
-// Exact closed-loop stability for the linear model INCLUDING the derivative
-// filter and (for LAG) the actuator: characteristic polynomial
-//   s(1+tf s)(1+ta s)(m s^2 + c s) + Kp s(1+tf s) + Ki(1+tf s) + Kd s^2 = 0
-static bool loop_stable(float m, float kp, float ki, float kd, ThrustProf prof)
-{
-    double tf = D_TAU, ta = (prof == TP_LAG) ? ACT_TAU : 0.0;
-    double a[6] = {
-        ta * tf * (double)m,
-        tf * (double)m + ta * (double)m + ta * tf * (double)DRAG,
-        (double)m + tf * (double)DRAG + ta * (double)DRAG,
-        (double)DRAG + (double)kd + (double)kp * tf,
-        (double)kp + (double)ki * tf,
-        (double)ki,
-    };
-    const double *p = a;
-    int deg = 5;
-    while (deg > 0 && fabs(p[0]) < 1e-12) { p++; deg--; }   // ta or tf = 0
-    if (deg > 0 && fabs(p[deg]) < 1e-9) deg--;  // Ki=0: spurious factor of s
-    if (deg <= 0 || fabs(p[deg]) < 1e-9) return false;      // pole at origin
-    return routh_stable(p, deg);
-}
-
-// ---------- Bode plot ----------
-
-// Open-loop L(jw) = C(jw)*A(jw)*G(jw) with the derivative filter and (for
-// LAG) the actuator included, so the margins are honest about both. SLEW is
-// nonlinear and has no transfer function; it is treated as instant here.
-// PM/GM are advisory (this loop can be conditionally stable, where single
-// crossings mislead); the STABLE/UNSTABLE verdict is exact via Routh.
-static void bode_draw(int lx, int ly, int lw, int lh, float m,
-                      float kp, float ki, float kd, ThrustProf prof)
-{
-    enum { BN = 160 };
-    float mag[BN], ph[BN], lg[BN];
-    double prev = 0.0;
-
-    for (int i = 0; i < BN; i++) {
-        double lgw = -1.5 + 3.5 * (double)i / (double)(BN - 1);  // 0.03..~100 rad/s
-        double w = pow(10.0, lgw);
-        double complex jw = I * w;
-        double complex G = 1.0 / ((double)m * jw * jw + (double)DRAG * jw);
-        double complex C = (double)kp + (double)kd * jw / (1.0 + jw * (double)D_TAU);
-        if (ki > 1e-6f) C += (double)ki / jw;
-        double complex A = (prof == TP_LAG) ? 1.0 / (1.0 + jw * (double)ACT_TAU) : 1.0;
-        double complex L = C * A * G;
-
-        mag[i] = (float)(20.0 * log10(cabs(L) + 1e-12));
-        double p = carg(L) * 180.0 / PI;
-        if (i > 0) {                                   // unwrap
-            while (p - prev > 180.0)  p -= 360.0;
-            while (p - prev < -180.0) p += 360.0;
-        } else {
-            // this plant lags at least -90 deg at low frequency; carg() can
-            // report ~+180 for a true -180, which would shift the whole
-            // unwrapped curve up a turn — pin the first sample negative
-            while (p > 0.0) p -= 360.0;
-        }
-        prev = p;
-        ph[i] = (float)p;
-        lg[i] = (float)lgw;
-    }
-
-    // margins: PM at the last 0 dB crossing, GM at the worst -180 crossing
-    float pm = NAN, w_pm = 0.0f, gm = NAN, w_gm = 0.0f;
-    for (int i = 1; i < BN; i++) {
-        if (mag[i - 1] >= 0.0f && mag[i] < 0.0f) {
-            float t = mag[i - 1] / (mag[i - 1] - mag[i]);
-            pm = 180.0f + ph[i - 1] + t * (ph[i] - ph[i - 1]);
-            w_pm = powf(10.0f, lg[i - 1] + t * (lg[i] - lg[i - 1]));
-        }
-        if ((ph[i - 1] > -180.0f) != (ph[i] > -180.0f)) {
-            float t = (ph[i - 1] + 180.0f) / (ph[i - 1] - ph[i]);
-            float g = -(mag[i - 1] + t * (mag[i] - mag[i - 1]));
-            if (isnan(gm) || g < gm) {
-                gm = g;
-                w_gm = powf(10.0f, lg[i - 1] + t * (lg[i] - lg[i - 1]));
-            }
-        }
-    }
-
-    // frame + two subplots (magnitude over phase)
-    DrawRectangle(lx, ly, lw, lh, (Color){ 16, 21, 36, 255 });
-    DrawRectangleLines(lx, ly, lw, lh, DARKGRAY);
-    int my0 = ly + 38, mh = (lh - 60) / 2;
-    int py0 = my0 + mh + 8, phh = mh;
-
-    bool stable = loop_stable(m, kp, ki, kd, prof);
-    DrawText(stable ? "BODE - closed loop STABLE (incl. filter & lag)"
-                    : "BODE - closed loop UNSTABLE (incl. filter & lag)",
-             lx + 8, ly + 6, 13, stable ? GREEN : RED);
-    const char *pm_s = isnan(pm) ? "--" : TextFormat("%.0f deg", pm);
-    DrawText(TextFormat("phase margin %s @ %.1f   gain margin %s @ %.1f rad/s",
-             pm_s, w_pm, isnan(gm) ? "--" : TextFormat("%.1f dB", gm), w_gm),
-             lx + 8, ly + 22, 12, LIGHTGRAY);
-
-    // decade gridlines + reference lines
-    for (int d = -1; d <= 2; d++) {
-        int px = lx + (int)(((float)d + 1.5f) / 3.5f * (float)lw);
-        DrawLine(px, my0, px, my0 + mh, Fade(DARKGRAY, 0.5f));
-        DrawLine(px, py0, px, py0 + phh, Fade(DARKGRAY, 0.5f));
-        DrawText(TextFormat("%g", pow(10.0, d)), px + 3, py0 + phh - 12, 12, DARKGRAY);
-    }
-    int zero_db = my0 + (int)(60.0f / 120.0f * (float)mh);
-    DrawLine(lx, zero_db, lx + lw, zero_db, Fade(SKYBLUE, 0.4f));
-    DrawText("0 dB", lx + 4, zero_db - 12, 12, Fade(SKYBLUE, 0.7f));
-    int m180 = py0 + (int)(180.0f / 360.0f * (float)phh);
-    DrawLine(lx, m180, lx + lw, m180, Fade(GOLD, 0.4f));
-    DrawText("-180", lx + 4, m180 - 12, 12, Fade(GOLD, 0.7f));
-
-    // traces
-    for (int i = 1; i < BN; i++) {
-        float x0 = (float)lx + (lg[i - 1] + 1.5f) / 3.5f * (float)lw;
-        float x1 = (float)lx + (lg[i] + 1.5f) / 3.5f * (float)lw;
-        float m0 = clampf(mag[i - 1], -60.0f, 60.0f);
-        float m1 = clampf(mag[i],     -60.0f, 60.0f);
-        DrawLineV((Vector2){ x0, (float)my0 + (60.0f - m0) / 120.0f * (float)mh },
-                  (Vector2){ x1, (float)my0 + (60.0f - m1) / 120.0f * (float)mh }, SKYBLUE);
-        float p0 = clampf(ph[i - 1], -360.0f, 0.0f);
-        float p1 = clampf(ph[i],     -360.0f, 0.0f);
-        DrawLineV((Vector2){ x0, (float)py0 + (0.0f - p0) / 360.0f * (float)phh },
-                  (Vector2){ x1, (float)py0 + (0.0f - p1) / 360.0f * (float)phh }, GOLD);
-    }
-    if (prof == TP_SLEW)
-        DrawText("slew is nonlinear: treated as instant", lx + lw - 230, ly + lh - 14, 12, ORANGE);
-}
-
-// ---------- phase portrait ----------
-
-static void phase_draw(const Chart *c, int lx, int ly, int lw, int lh)
-{
-    const float E_MAX = 60.0f, V_MAX = 40.0f;
-
-    DrawRectangle(lx, ly, lw, lh, (Color){ 16, 21, 36, 255 });
-    DrawRectangleLines(lx, ly, lw, lh, DARKGRAY);
-    int cx = lx + lw / 2, cy = ly + lh / 2;
-    DrawLine(lx, cy, lx + lw, cy, Fade(DARKGRAY, 0.6f));
-    DrawLine(cx, ly, cx, ly + lh, Fade(DARKGRAY, 0.6f));
-    DrawLine(cx - 5, cy, cx + 5, cy, GOLD);            // target equilibrium
-    DrawLine(cx, cy - 5, cx, cy + 5, GOLD);
-
-    for (int i = 1; i < c->count; i++) {
-        int i0 = (c->head - c->count + i - 1 + CHART_N) % CHART_N;
-        int i1 = (i0 + 1) % CHART_N;
-        float e0 = clampf(c->sp[i0] - c->y[i0], -E_MAX, E_MAX);
-        float e1 = clampf(c->sp[i1] - c->y[i1], -E_MAX, E_MAX);
-        float v0 = clampf(c->v[i0], -V_MAX, V_MAX);
-        float v1 = clampf(c->v[i1], -V_MAX, V_MAX);
-        float alpha = 0.10f + 0.85f * (float)i / (float)c->count;
-        DrawLineV((Vector2){ (float)lx + (e0 + E_MAX) / (2 * E_MAX) * (float)lw,
-                             (float)ly + (V_MAX - v0) / (2 * V_MAX) * (float)lh },
-                  (Vector2){ (float)lx + (e1 + E_MAX) / (2 * E_MAX) * (float)lw,
-                             (float)ly + (V_MAX - v1) / (2 * V_MAX) * (float)lh },
-                  Fade(SKYBLUE, alpha));
-    }
-    if (c->count > 0) {
-        int il = (c->head - 1 + CHART_N) % CHART_N;
-        float e = clampf(c->sp[il] - c->y[il], -E_MAX, E_MAX);
-        float v = clampf(c->v[il], -V_MAX, V_MAX);
-        DrawCircleV((Vector2){ (float)lx + (e + E_MAX) / (2 * E_MAX) * (float)lw,
-                               (float)ly + (V_MAX - v) / (2 * V_MAX) * (float)lh },
-                    3.5f, RAYWHITE);
-    }
-    DrawText("PHASE PORTRAIT: error (x) vs velocity (y), last 20 s",
-             lx + 8, ly + 6, 13, LIGHTGRAY);
-    DrawText("spiral into the crosshair = damped convergence",
-             lx + 8, ly + 22, 12, DARKGRAY);
-}
-
-// ---------- predicted step response ----------
-
-// Simulate the LINEAR closed loop (deviation coordinates: feedforward cancels
-// gravity, no saturation or ground) for a unit setpoint step with the current
-// gains, filter, and (for LAG) actuator. This is the response the sliders
-// "promise"; the flight shows what saturation and disturbances do to it.
-static void step_predict(StepPred *sp, float m, float kp, float ki, float kd,
-                         ThrustProf prof)
-{
-    const float dt = 1.0f / 120.0f;
-    const int n = (int)(STEP_T / dt);
-    const int sub = n / STEP_N;
-    float y = 0.0f, v = 0.0f, integ = 0.0f, dfilt = 0.0f, prevy = 0.0f, uact = 0.0f;
-
-    sp->ov_pct = 0.0f;
-    sp->settle = -1.0f;
-    sp->diverged = false;
-    for (int i = 0; i < n; i++) {
-        float e = 1.0f - y;
-        integ += ki * e * dt;
-        float draw = -(y - prevy) / dt;
-        prevy = y;
-        dfilt += (draw - dfilt) * dt / (D_TAU + dt);
-        float ucmd = kp * e + integ + kd * dfilt;
-        uact = actuate(uact, ucmd, (prof == TP_LAG) ? TP_LAG : TP_INSTANT, dt);
-        v += (uact - DRAG * v) / m * dt;
-        y += v * dt;
-
-        if (i % sub == 0) sp->curve[i / sub] = y;
-        if (y - 1.0f > sp->ov_pct) sp->ov_pct = y - 1.0f;
-        if (fabsf(1.0f - y) > 0.02f) sp->settle = -1.0f;
-        else if (sp->settle < 0.0f) sp->settle = (float)i * dt;
-        if (fabsf(y) > 100.0f) {
-            sp->diverged = true;
-            for (int k = (i / sub) + 1; k < STEP_N; k++) sp->curve[k] = y;
-            break;
-        }
-    }
-    sp->ov_pct *= 100.0f;
-}
-
-static void step_draw(const StepPred *sp, int lx, int ly, int lw, int lh)
-{
-    const float Y_TOP = 1.8f;                      // plotted range 0..1.8
-
-    DrawRectangle(lx, ly, lw, lh, (Color){ 16, 21, 36, 255 });
-    DrawRectangleLines(lx, ly, lw, lh, DARKGRAY);
-    DrawText("PREDICTED STEP RESPONSE (linear, no saturation)",
-             lx + 8, ly + 6, 13, LIGHTGRAY);
-    if (sp->diverged)
-        DrawText("UNSTABLE: response diverges", lx + 8, ly + 22, 12, RED);
-    else
-        DrawText(TextFormat("overshoot %.1f%%   2%%-settle %s", sp->ov_pct,
-                 sp->settle < 0.0f ? "> 10 s" : TextFormat("%.1f s", sp->settle)),
-                 lx + 8, ly + 22, 12, SKYBLUE);
-
-    int gy = ly + 40, gh = lh - 58;
-    int target = gy + (int)((Y_TOP - 1.0f) / Y_TOP * (float)gh);
-    DrawLine(lx, target, lx + lw, target, Fade(GOLD, 0.6f));
-    DrawText("target", lx + 4, target - 14, 12, Fade(GOLD, 0.8f));
-    int band = (int)(0.02f / Y_TOP * (float)gh);
-    DrawLine(lx, target - band, lx + lw, target - band, Fade(GOLD, 0.2f));
-    DrawLine(lx, target + band, lx + lw, target + band, Fade(GOLD, 0.2f));
-    for (int s = 0; s <= (int)STEP_T; s += 2) {
-        int px = lx + (int)((float)s / STEP_T * (float)lw);
-        DrawLine(px, gy, px, gy + gh, Fade(DARKGRAY, 0.4f));
-        DrawText(TextFormat("%ds", s), px + 3, gy + gh + 2, 12, DARKGRAY);
-    }
-
-    for (int i = 1; i < STEP_N; i++) {
-        float y0 = clampf(sp->curve[i - 1], -0.05f, Y_TOP);
-        float y1 = clampf(sp->curve[i],     -0.05f, Y_TOP);
-        DrawLineV((Vector2){ (float)lx + (float)(i - 1) / (STEP_N - 1) * (float)lw,
-                             (float)gy + (Y_TOP - y0) / Y_TOP * (float)gh },
-                  (Vector2){ (float)lx + (float)i / (STEP_N - 1) * (float)lw,
-                             (float)gy + (Y_TOP - y1) / Y_TOP * (float)gh },
-                  SKYBLUE);
-    }
 }
 
 // Signed horizontal bar for one controller term, centered at cx.
@@ -928,7 +127,9 @@ int main(void)
 
     Gust gust = { 0 };
     bool wind_on = false;
-    bool paused = false;
+    bool paused = true;              // hold physics until the pilot is ready
+    bool launched = false;           // first unpause shows a launch banner
+    unsigned char push_flags = 0;    // event flags carried into the next sample
 
     Chart chart = { 0 };
 
@@ -951,7 +152,7 @@ int main(void)
     StepMeas sm = { 0 };
     float sp_prev_step = SP_START;   // setpoint at the previous physics step
 
-    // wind streak particles (screen space, wrap horizontally)
+    // wind streak particles (screen space, wrap vertically with the gust)
     float wpx[WPART], wpy[WPART];
     for (int i = 0; i < WPART; i++) {
         wpx[i] = frand((float)VIEW_X0 + 10, (float)VIEW_X1 - 10);
@@ -974,6 +175,7 @@ int main(void)
             pid_reset(&ctrl);
             seq.playing = false;
             at.running = false;
+            push_flags |= CF_RESET;         // mark the teleport in the history
         }
         if (IsKeyPressed(KEY_P)) {
             pid_on = !pid_on;
@@ -986,6 +188,11 @@ int main(void)
         }
         if (IsKeyPressed(KEY_L))     plot = (PlotMode)((plot + 1) % 5);
         if (IsKeyPressed(KEY_ENTER)) paused = !paused;
+        // before first launch, any flight input releases the hold too
+        if (paused && !launched &&
+            (IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_P)))
+            paused = false;
+        if (!paused) launched = true;
         if (IsKeyDown(KEY_UP))   setpoint += SP_RATE * frame;
         if (IsKeyDown(KEY_DOWN)) setpoint -= SP_RATE * frame;
         setpoint = clampf(setpoint, 0.0f, WORLD_H);
@@ -1048,59 +255,20 @@ int main(void)
                 float u_cmd;
                 if (sim.crashed) {
                     u_cmd = 0.0f;                       // wreckage doesn't thrust
-                    if (at.running) {
-                        at.running = false;
-                        snprintf(at.result, sizeof at.result, "AUTOTUNE aborted: crashed");
-                        at.result_t = t_sim;
-                    }
+                    if (at.running)
+                        autotune_cancel(&at, "AUTOTUNE aborted: crashed", t_sim);
                 } else if (at.running) {
-                    // relay experiment: bang-bang thrust around the setpoint
-                    float e = setpoint - meas;
-                    if (at.sign > 0 && e < -at.h) {
-                        at.sign = -1;
-                    } else if (at.sign < 0 && e > at.h) {
-                        at.sign = +1;
-                        at.ups++;
-                        if (at.ups == 3) {              // transient over: start measuring
-                            at.ymin = at.ymax = sim.y;
-                            at.last_up_t = t_sim;
-                        } else if (at.ups > 3) {
-                            at.periods[at.np++] = t_sim - at.last_up_t;
-                            at.last_up_t = t_sim;
-                        }
-                    }
-                    if (at.ups >= 3) {
-                        if (sim.y < at.ymin) at.ymin = sim.y;
-                        if (sim.y > at.ymax) at.ymax = sim.y;
-                    }
-                    u_cmd = u_ff + (float)at.sign * at.d;
-
-                    if (at.np >= 3) {                   // enough cycles: compute Ku/Tu
-                        float tu = (at.periods[0] + at.periods[1] + at.periods[2]) / 3.0f;
-                        float a = (at.ymax - at.ymin) / 2.0f;
-                        if (a > 0.01f && tu > 0.05f) {
-                            at.ku = 4.0f * at.d / (PI * a);
-                            at.tu = tu;
-                            kp = clampf(0.6f * at.ku, 0.0f, KP_TOP);   // classic Z-N PID
-                            ki = clampf(1.2f * at.ku / tu, 0.0f, KI_TOP);
-                            kd = clampf(0.075f * at.ku * tu, 0.0f, KD_TOP);
-                            snprintf(at.result, sizeof at.result,
-                                     "AUTOTUNE: Ku=%.1f Tu=%.2fs -> Ziegler-Nichols applied "
-                                     "(more rules unlocked)", at.ku, at.tu);
-                            mode = CM_PID;
-                            pid_reset(&ctrl);
-                            pid_on = true;
-                        } else {
-                            snprintf(at.result, sizeof at.result,
-                                     "AUTOTUNE failed: oscillation too small");
-                        }
-                        at.running = false;
-                        at.result_t = t_sim;
-                    } else if (t_sim - at.t_start > 30.0f) {
-                        snprintf(at.result, sizeof at.result,
-                                 "AUTOTUNE failed: no steady oscillation in 30 s");
-                        at.running = false;
-                        at.result_t = t_sim;
+                    float u_rel;
+                    AtStatus st = autotune_step(&at, setpoint - meas, sim.y,
+                                                t_sim, &u_rel);
+                    u_cmd = u_ff + u_rel;
+                    if (st == AT_DONE) {                // apply classic Z-N PID
+                        kp = clampf(0.6f * at.ku, 0.0f, KP_TOP);
+                        ki = clampf(1.2f * at.ku / at.tu, 0.0f, KI_TOP);
+                        kd = clampf(0.075f * at.ku * at.tu, 0.0f, KD_TOP);
+                        mode = CM_PID;
+                        pid_reset(&ctrl);
+                        pid_on = true;
                     }
                 } else if (pid_on) {
                     u_cmd = u_ff + pid_update(&ctrl, setpoint, meas, SIM_DT);
@@ -1136,7 +304,9 @@ int main(void)
                 acc -= SIM_DT;
                 if (++chart.div >= 120 / CHART_HZ) {
                     chart.div = 0;
-                    chart_push(&chart, sim.y, setpoint, sim.u, sim.wind, sim.v);
+                    chart_push(&chart, sim.y, setpoint, sim.u, sim.wind, sim.v,
+                               push_flags);
+                    push_flags = 0;
                 }
             }
         }
@@ -1170,7 +340,7 @@ int main(void)
             DrawText(TextFormat("%d m", m), VIEW_X0 + 16, py - 7, 12, DARKGRAY);
         }
 
-        // wind streaks
+        // wind streaks (vertical: the gust force acts along the flight axis)
         if (wind_on && fabsf(sim.wind) > 0.3f) {
             float alpha = clampf(0.15f + fabsf(sim.wind) / 15.0f, 0.15f, 0.8f);
             float len = clampf(8.0f + fabsf(sim.wind) * 1.2f, 8.0f, 70.0f);
@@ -1221,8 +391,13 @@ int main(void)
                              ORANGE);
             }
         }
-        if (paused)
+        if (paused && !launched) {
+            DrawText("PRESS ENTER TO LAUNCH", craftCX - 220, (VIEW_Y0 + VIEW_Y1) / 2 - 60, 34, GOLD);
+            DrawText("the craft free-falls until you thrust (SPACE) or engage the PID (P)",
+                     craftCX - 240, (VIEW_Y0 + VIEW_Y1) / 2 - 16, 15, LIGHTGRAY);
+        } else if (paused) {
             DrawText("PAUSED", craftCX - 70, (VIEW_Y0 + VIEW_Y1) / 2 - 40, 34, YELLOW);
+        }
         if (at.running)
             DrawText(TextFormat("AUTOTUNING: relay cycle %d, measuring %d/3 periods",
                      at.ups, at.np), VIEW_X0 + 40, VIEW_Y0 + 14, 17, YELLOW);
@@ -1368,25 +543,15 @@ int main(void)
             plot = (PlotMode)((plot + 1) % 5);
         if (ui_button((Rectangle){ 1360, 598, 200, 28 }, "AUTOTUNE", at.running)) {
             if (at.running) {
-                at.running = false;             // cancel
-                snprintf(at.result, sizeof at.result, "AUTOTUNE cancelled");
-                at.result_t = t_sim;
+                autotune_cancel(&at, "AUTOTUNE cancelled", t_sim);
             } else {
                 float d = fminf(u_ff, u_max - u_ff) * 0.8f;
                 if (d < 0.5f) {
-                    snprintf(at.result, sizeof at.result,
-                             "AUTOTUNE needs thrust authority both ways (check max thrust)");
-                    at.result_t = t_sim;
+                    autotune_cancel(&at,
+                        "AUTOTUNE needs thrust authority both ways (check max thrust)",
+                        t_sim);
                 } else {
-                    float ku_keep = at.ku, tu_keep = at.tu;
-                    at = (Autotune){ 0 };
-                    at.ku = ku_keep;            // keep old rule presets until remeasured
-                    at.tu = tu_keep;
-                    at.running = true;
-                    at.d = d;
-                    at.h = 0.5f + 2.0f * noise_sigma;
-                    at.sign = +1;
-                    at.t_start = t_sim;
+                    autotune_begin(&at, d, 0.5f + 2.0f * noise_sigma, t_sim);
                     seq.playing = false;
                     pid_on = false;             // relay takes over
                 }

@@ -11,9 +11,10 @@ ifeq ($(RAYLIB_FLAGS),)
 RAYLIB_FLAGS := -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
 endif
 
-SRC := main.c pid.c ui.c
+SRC := main.c pid.c ui.c util.c sim.c chart.c seq.c plots.c autotune.c
+HDR := config.h pid.h ui.h util.h sim.h chart.h seq.h plots.h autotune.h
 
-lander: $(SRC) pid.h ui.h
+lander: $(SRC) $(HDR)
 	$(CC) $(CFLAGS) $(SRC) -o $@ $(RAYLIB_FLAGS)
 ifeq ($(OS),Windows_NT)
 	# MSYS2's raylib is a DLL; keep it (and its glfw3 dependency) next to
@@ -24,12 +25,14 @@ endif
 run: lander
 	./lander
 
-# Headless closed-loop tests: no raylib needed, prints step/gust metrics.
-test: test_pid.c pid.c pid.h
+# Headless tests: PID closed-loop metrics + chart ring-buffer integrity.
+test: test_pid.c pid.c pid.h test_chart.c chart.c sim.c util.c
 	$(CC) $(CFLAGS) test_pid.c pid.c -o test_pid -lm
 	./test_pid
+	$(CC) $(CFLAGS) test_chart.c chart.c sim.c util.c -o test_chart $(RAYLIB_FLAGS)
+	./test_chart
 
 clean:
-	rm -f lander lander.exe test_pid test_pid.exe
+	rm -f lander lander.exe test_pid test_pid.exe test_chart test_chart.exe
 
 .PHONY: run test clean
