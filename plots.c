@@ -121,7 +121,7 @@ void locus_draw(int lx, int ly, int lw, int lh,
 {
     const double RE_MIN = -9.0, RE_MAX = 3.0, IM_MAX = 6.0;
 
-    DrawRectangle(lx, ly, lw, lh, (Color){ 16, 21, 36, 255 });
+    DrawRectangle(lx, ly, lw, lh, COL_PLOT_BG);
     DrawRectangleLines(lx, ly, lw, lh, DARKGRAY);
 
     // unstable half-plane shading + axes
@@ -220,7 +220,7 @@ void bode_draw(int lx, int ly, int lw, int lh, float m,
     }
 
     // frame + two subplots (magnitude over phase)
-    DrawRectangle(lx, ly, lw, lh, (Color){ 16, 21, 36, 255 });
+    DrawRectangle(lx, ly, lw, lh, COL_PLOT_BG);
     DrawRectangleLines(lx, ly, lw, lh, DARKGRAY);
     int my0 = ly + 38, mh = (lh - 60) / 2;
     int py0 = my0 + mh + 8, phh = mh;
@@ -271,7 +271,7 @@ void phase_draw(const Chart *c, int lx, int ly, int lw, int lh)
 {
     const float E_MAX = 60.0f, V_MAX = 40.0f;
 
-    DrawRectangle(lx, ly, lw, lh, (Color){ 16, 21, 36, 255 });
+    DrawRectangle(lx, ly, lw, lh, COL_PLOT_BG);
     DrawRectangleLines(lx, ly, lw, lh, DARKGRAY);
     int cx = lx + lw / 2, cy = ly + lh / 2;
     DrawLine(lx, cy, lx + lw, cy, Fade(DARKGRAY, 0.6f));
@@ -352,7 +352,7 @@ void step_draw(const StepPred *sp, int lx, int ly, int lw, int lh)
 {
     const float Y_TOP = 1.8f;                      // plotted range 0..1.8
 
-    DrawRectangle(lx, ly, lw, lh, (Color){ 16, 21, 36, 255 });
+    DrawRectangle(lx, ly, lw, lh, COL_PLOT_BG);
     DrawRectangleLines(lx, ly, lw, lh, DARKGRAY);
     DrawText("PREDICTED STEP RESPONSE (linear, no saturation)",
              lx + 8, ly + 6, 13, LIGHTGRAY);

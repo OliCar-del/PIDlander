@@ -43,9 +43,9 @@ static float wnd_py(float w)         // wind N -> force-strip row (0 centered)
 
 void chart_draw(const Chart *c, float u_max)
 {
-    DrawRectangle(CHART_X, CHART_Y, CHART_W, CHART_HGT, (Color){ 16, 21, 36, 255 });
+    DrawRectangle(CHART_X, CHART_Y, CHART_W, CHART_HGT, COL_PLOT_BG);
     DrawRectangleLines(CHART_X, CHART_Y, CHART_W, CHART_HGT, DARKGRAY);
-    DrawText("HISTORY - last 20 s, newest at right", CHART_X + 10, CHART_Y + 5, 14, GRAY);
+    DrawText("HISTORY - last 20 s, newest at right", CHART_X + 20, CHART_Y + 5, 14, GRAY);
 
     // altitude strip: 0..100 m
     DrawRectangleLines(CHART_X, ALT_Y, CHART_W, ALT_H, Fade(DARKGRAY, 0.9f));
@@ -89,7 +89,7 @@ void chart_draw(const Chart *c, float u_max)
 
     int ly = CHART_Y + CHART_HGT - 20;
     DrawText("altitude", CHART_X + 10,  ly, 14, RAYWHITE);
-    DrawText("(red = on ground)", CHART_X + 350, ly, 14, Fade(RED, 0.8f));
+    DrawText("(red = on ground)", CHART_X + 400, ly, 14, Fade(RED, 0.8f));
     DrawText("setpoint", CHART_X + 80,  ly, 14, SKYBLUE);
     DrawText(TextFormat("thrust (0-%.0f N)", u_max), CHART_X + 152, ly, 14,
              Fade(ORANGE, 0.9f));

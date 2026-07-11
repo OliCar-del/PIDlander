@@ -7,6 +7,8 @@
 #include "ui.h"
 #include "util.h"
 
+#define SEQ_HIT_R2 121.0f   // squared grab radius for a point (11 px circle)
+
 // Keep points inside the timeframe/world and ordered in time.
 static void seq_normalize(Seq *q)
 {
@@ -65,7 +67,7 @@ void seq_panel(Seq *q, float live_setpoint)
     }
 
     // graph frame
-    DrawRectangle(SEQ_GX, SEQ_GY, SEQ_GW, SEQ_GH, (Color){ 16, 21, 36, 255 });
+    DrawRectangle(SEQ_GX, SEQ_GY, SEQ_GW, SEQ_GH, COL_PLOT_BG);
     DrawRectangleLines(SEQ_GX, SEQ_GY, SEQ_GW, SEQ_GH, DARKGRAY);
     int mid = (int)seq_sy(50.0f);
     DrawLine(SEQ_GX, mid, SEQ_GX + SEQ_GW, mid, Fade(DARKGRAY, 0.5f));
@@ -79,7 +81,7 @@ void seq_panel(Seq *q, float live_setpoint)
         for (int i = 0; i < q->n; i++) {
             float dxp = mp.x - seq_sx(q, q->t[i]);
             float dyp = mp.y - seq_sy(q->y[i]);
-            if (dxp * dxp + dyp * dyp < 121.0f) { q->drag = i; break; }
+            if (dxp * dxp + dyp * dyp < SEQ_HIT_R2) { q->drag = i; break; }
         }
     }
     if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) q->drag = -1;

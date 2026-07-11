@@ -16,7 +16,8 @@ typedef struct SimState {
     float wind;     // current gust force [N], set by the gust model
     bool  landed;   // resting on the ground (gently)
     bool  crashed;  // touched down above the crash speed
-    float impact;   // touchdown speed of the crash [m/s]
+    bool  grounded; // in ground contact this step (crashed or not)
+    float impact;   // touchdown speed of the last landing [m/s], -1 = none yet
 } SimState;
 
 // Randomized smooth gust generator: quiet gap, then a (1-cos)/2 pulse.
