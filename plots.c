@@ -280,7 +280,7 @@ void phase_draw(const Chart *c, int lx, int ly, int lw, int lh)
     DrawLine(cx, cy - 5, cx, cy + 5, GOLD);
 
     for (int i = 1; i < c->count; i++) {
-        int i0 = (c->head - c->count + i - 1 + CHART_N) % CHART_N;
+        int i0 = (c->head - c->count + i - 1 + 2 * CHART_N) % CHART_N; 
         int i1 = (i0 + 1) % CHART_N;
         float e0 = clampf(c->sp[i0] - c->y[i0], -E_MAX, E_MAX);
         float e1 = clampf(c->sp[i1] - c->y[i1], -E_MAX, E_MAX);

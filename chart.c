@@ -64,7 +64,7 @@ void chart_draw(const Chart *c, float u_max)
     float dx = (float)CHART_W / (float)(CHART_N - 1);
     float xr = (float)(CHART_X + CHART_W);      // newest sample lives here
     for (int i = 1; i < c->count; i++) {
-        int i0 = (c->head - c->count + i - 1 + CHART_N) % CHART_N;
+        int i0 = (c->head - c->count + i - 1 + 2 * CHART_N) % CHART_N;
         int i1 = (i0 + 1) % CHART_N;
         float x0 = xr - (float)(c->count - i) * dx;
         float x1 = xr - (float)(c->count - 1 - i) * dx;
