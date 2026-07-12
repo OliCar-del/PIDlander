@@ -20,6 +20,10 @@ The physics simulation runs on a decoupled, fixed 120 Hz timestep using semi-imp
 ![sequence changing](set_sequence.gif "Adjusting sequence of altitudes and timing/number of points")
 <span style="font-size: 14px">Figure 4; Adjusting flight sequence, number of altitudes, timespan and altitude setting. Errors and effort are logged for plays on each sequence. Control weights can be adjusted and tested against known sequence.</span>
 
+<video src= 'https://www.youtube.com/watch?v=yYE1kUrhGyA' width="800" height="400" controls></video>
+
+<span style="font-size: 14px">Figure 5; Playing the sequence. Craft is landed successfully as displayed with m/s landing speed. Sequence can be rerun with different parameters.</span>
+
 ## Core Technical Features
 
 * **Industrial PID Architecture:** The control law extends beyond textbook PID, implementing integrator anti-windup (conditional integration with bumpless tuning), derivative on measurement (to prevent setpoint kick), a discrete 50 ms first-order low-pass derivative filter, and gravity feedforward.
