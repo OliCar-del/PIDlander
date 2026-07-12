@@ -24,7 +24,7 @@ The physics simulation runs on a decoupled, fixed 120 Hz timestep using semi-imp
   <img src="https://img.youtube.com/vi/yYE1kUrhGyA/maxresdefault.jpg" alt="PIDlander gameplay sequence" width="560" />
 </a>
 <br>
-<span style="font-size: 14px">Figure 5; Playing the sequence. Craft is landed successfully as displayed with m/s landing speed. Sequence can be rerun with different parameters.</span>
+<span style="font-size: 14px">Figure 5; Youtube vide of sample playing the sequence. Craft is landed successfully as displayed with m/s landing speed. Sequence can be rerun with different parameters.</span>
 
 ## Core Technical Features
 
