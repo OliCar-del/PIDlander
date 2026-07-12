@@ -11,8 +11,13 @@ PIDlander presents an interactive lunar-lander environment where thrust is gover
 
 The physics simulation runs on a decoupled, fixed 120 Hz timestep using semi-implicit Euler integration to prevent the slow energy injection typical of explicit methods, ensuring the numerical stability required for marginal-stability experiments. Rendering and UI are handled via `raylib`.
 
-![gameplay](begin_toggle_pid.gif "stepping through PID, play, landing and control")
-<span style="font-size: 14px">Figure 2; Brief sample of gameplay. Game is started with button press and manually controlled by user-presses on spacebar by default. PID control can be started by pressing 'P'. Default control gains can be altered with panel at right, as well as wind strength, mass accuracy, gravity and more. Bottom right panel shows sequence (click and drag) altitude setting, started by pressing play. Error and effort of control scheme are displayed at left once sequence has concluded. Plot type can be changed between root locus, bode, phase and step response. Messages are displayed for successful landing or crash. Restart with R.</span>
+![gameplay](begin_toggle_pid.gif "stepping through PID toggle control")
+<span style="font-size: 14px">Figure 2; Brief sample of gameplay. Game is started with button press and manually controlled by user-presses on spacebar by default. PID control can be started by pressing 'P'. Control gain bars and telemtry are at left, history plot of altitude, wind force, thrust and altitude set at bottom. Toggle panel at right sets controls.</span>
+
+![gameplay](plot_toggle.gif "Changing plots between bode, phase, root locus and step response")
+<span style="font-size: 14px">Figure 3; Changing plots between bode, phase, root locus and step response</span>
+
+
 
 ## Core Technical Features
 
