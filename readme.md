@@ -17,7 +17,8 @@ The physics simulation runs on a decoupled, fixed 120 Hz timestep using semi-imp
 ![gameplay](plot_toggle.gif "Changing plots between bode, phase, root locus and step response")
 <span style="font-size: 14px">Figure 3; Changing plots between bode, phase, root locus and step response</span>
 
-
+![sequence changing](set_sequence.gif "Adjusting sequence of altitudes and timing/number of points")
+<span style="font-size: 14px">Figure 4; Adjusting flight sequence, number of altitudes, timespan and altitude setting. Errors and effort are logged for plays on each sequence. Control weights can be adjusted and tested against known sequence.</span>
 
 ## Core Technical Features
 
