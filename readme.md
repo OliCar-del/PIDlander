@@ -3,6 +3,7 @@
 A real-time 1-D flight control sandbox written in C99, built to demonstrate end-to-end classical control theory and deterministic simulation techniques.
 
 ![dashboard](loadscreen.png "Paused pre-launch screen")
+<br>
 <span style="font-size: 14px">Figure 1; Prelaunch screen with telemetry panels and PID control windows. Lander is simple white rectangle at image centre. Aim to control altitude settling with Kp, Kd and Ki.</span>
 
 ## Overview
@@ -12,12 +13,14 @@ PIDlander presents an interactive lunar-lander environment where thrust is gover
 The physics simulation runs on a decoupled, fixed 120 Hz timestep using semi-implicit Euler integration to prevent the slow energy injection typical of explicit methods, ensuring the numerical stability required for marginal-stability experiments. Rendering and UI are handled via `raylib`.
 
 ![gameplay](begin_toggle_pid.gif "stepping through PID toggle control")
+<br>
 <span style="font-size: 14px">Figure 2; Brief sample of gameplay. Game is started with button press and manually controlled by user-presses on spacebar by default. PID control can be started by pressing 'P'. Control gain bars and telemtry are at left, history plot of altitude, wind force, thrust and altitude set at bottom. Toggle panel at right sets controls.</span>
 
 ![gameplay](plot_toggle.gif "Changing plots between bode, phase, root locus and step response")
 <span style="font-size: 14px">Figure 3; Changing plots between bode, phase, root locus and step response</span>
 
 ![sequence changing](set_sequence.gif "Adjusting sequence of altitudes and timing/number of points")
+<br>
 <span style="font-size: 14px">Figure 4; Adjusting flight sequence, number of altitudes, timespan and altitude setting. Errors and effort are logged for plays on each sequence. Control weights can be adjusted and tested against known sequence.</span>
 
 <a href="https://youtu.be/yYE1kUrhGyA" target="_blank">
