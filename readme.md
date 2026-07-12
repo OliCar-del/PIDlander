@@ -20,7 +20,10 @@ The physics simulation runs on a decoupled, fixed 120 Hz timestep using semi-imp
 ![sequence changing](set_sequence.gif "Adjusting sequence of altitudes and timing/number of points")
 <span style="font-size: 14px">Figure 4; Adjusting flight sequence, number of altitudes, timespan and altitude setting. Errors and effort are logged for plays on each sequence. Control weights can be adjusted and tested against known sequence.</span>
 
-<iframe width="560" height="315" src="https://youtu.be/yYE1kUrhGyA" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+<a href="https://youtu.be/yYE1kUrhGyA" target="_blank">
+  <img src="https://img.youtube.com/vi/yYE1kUrhGyA/maxresdefault.jpg" alt="PIDlander gameplay sequence" width="560" />
+</a>
+<br>
 <span style="font-size: 14px">Figure 5; Playing the sequence. Craft is landed successfully as displayed with m/s landing speed. Sequence can be rerun with different parameters.</span>
 
 ## Core Technical Features
