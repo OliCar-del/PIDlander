@@ -2,7 +2,7 @@
 
 A real-time 1-D flight control sandbox written in C99, built to demonstrate end-to-end classical control theory and deterministic simulation techniques.
 
-![dashboard](loadscreen.png "Paused pre-launch screen")
+![dashboard](console.png "Paused pre-launch screen")
 <br>
 <span style="font-size: 14px">Figure 1; Prelaunch screen with telemetry panels and PID control windows. Lander is simple white rectangle at image centre. Aim to control altitude settling with Kp, Kd and Ki.</span>
 
